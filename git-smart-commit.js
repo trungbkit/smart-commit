@@ -466,6 +466,10 @@ function mergeBranch(from, to) {
 }
 
 function createPullRequest(from, to, title) {
+  // Strip remote prefix (e.g. "origin/uat" → "uat") so gh CLI receives a plain branch name
+  from = from.replace(/^[^/]+\//, '');
+  to = to.replace(/^[^/]+\//, '');
+
   // Check if gh CLI is available
   const hasGh = exec('which gh', true);
   if (!hasGh) {
@@ -489,6 +493,7 @@ function createPullRequest(from, to, title) {
     log(`PR created: ${from} → ${to}`, 'success');
   } catch (e) {
     // PR might already exist, that's ok
+    console.log(e.message);
     log(`PR may already exist for ${from} → ${to}`, 'warning');
   }
 }
