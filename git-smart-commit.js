@@ -26,8 +26,6 @@
  */
 
 const { execSync, spawnSync } = require('child_process');
-const fs = require('fs');
-const path = require('path');
 const https = require('https');
 
 // ============================================================================
@@ -37,7 +35,6 @@ const https = require('https');
 const CONFIG = {
   oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN,
   apiKey: process.env.ANTHROPIC_API_KEY,
-  apiUrl: 'https://api.anthropic.com/v1/messages',
   model: 'claude-haiku-4-5-20251001',  // Optimized for classification tasks like commit messages
   maxTokens: 500,
   defaultTargets: ['uat', 'main'],
@@ -77,6 +74,24 @@ function exec(cmd, silent = false) {
     }
     throw e;  // Throw error instead of returning null
   }
+}
+
+// Run a command with arguments passed as an array (no shell). This avoids
+// shell interpolation entirely, so values like commit messages or PR titles
+// that contain `"`, backticks, `$()`, etc. can never be interpreted as shell
+// syntax. Returns trimmed stdout; throws on non-zero exit.
+function run(file, args) {
+  const result = spawnSync(file, args, { encoding: 'utf-8' });
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    const stderr = (result.stderr || '').trim();
+    const err = new Error(stderr || `${file} exited with code ${result.status}`);
+    err.stderr = result.stderr;
+    throw err;
+  }
+  return (result.stdout || '').trim();
 }
 
 function checkPrerequisites() {
@@ -189,17 +204,19 @@ function getRecentCommits(count = 5) {
 
 function getDiffBetweenBranches(fromBranch, toBranch) {
   try {
-    // Use three-dot diff to show changes on fromBranch not in toBranch
-    let diff = exec(`git diff ${toBranch}...${fromBranch}`, true);
+    // Always diff against the remote ref so we use the up-to-date branch on
+    // origin rather than a potentially stale local tracking branch.
+    const remoteRef = `origin/${toBranch}`;
+    let diff = exec(`git diff ${remoteRef}...${fromBranch}`, true);
 
     if (!diff) {
       // If no diff found, try two-dot diff as fallback
-      diff = exec(`git diff ${toBranch} ${fromBranch}`, true);
+      diff = exec(`git diff ${remoteRef} ${fromBranch}`, true);
     }
 
     if (!diff) {
       log(
-        `No changes found between ${toBranch} and ${fromBranch}.
+        `No changes found between ${remoteRef} and ${fromBranch}.
         Branch may already be merged or no commits ahead.`,
         'warning'
       );
@@ -219,7 +236,7 @@ function getDiffBetweenBranches(fromBranch, toBranch) {
     return diff;
   } catch (err) {
     log(
-      `Could not get diff between ${toBranch} and ${fromBranch}: ${err.message}`,
+      `Could not get diff between origin/${toBranch} and ${fromBranch}: ${err.message}`,
       'warning'
     );
     return '';
@@ -417,7 +434,7 @@ function stageChanges() {
 function createCommit(message) {
   log(`Creating commit: "${message}"`, 'loading');
   try {
-    exec(`git commit -m "${message.replace(/"/g, '\\"')}"`, true);
+    run('git', ['commit', '-m', message]);
     log('Commit created', 'success');
     return message;
   } catch (err) {
@@ -465,10 +482,22 @@ function mergeBranch(from, to) {
   exec(`git checkout ${currentBranch}`, true);
 }
 
+// Parse "owner/repo" from the origin remote URL (HTTPS or SSH).
+// Uses the push URL, which may differ from the fetch URL in fork setups.
+function getOriginRepo() {
+  try {
+    const url = exec('git remote get-url --push origin', true);
+    const match = url.match(/github\.com[:/]([^/]+\/[^/.]+)/);
+    return match ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
 function createPullRequest(from, to, title) {
-  // Strip remote prefix (e.g. "origin/uat" → "uat") so gh CLI receives a plain branch name
-  from = from.replace(/^[^/]+\//, '');
-  to = to.replace(/^[^/]+\//, '');
+  // Strip "origin/" remote prefix only — preserve branch namespaces like "mch/feature"
+  from = from.replace(/^origin\//, '');
+  to = to.replace(/^origin\//, '');
 
   // Check if gh CLI is available
   const hasGh = exec('which gh', true);
@@ -483,27 +512,63 @@ function createPullRequest(from, to, title) {
     return;
   }
 
+  const originRepo = getOriginRepo();
+  const repoArgs = originRepo ? ['--repo', originRepo] : [];
+
+  // Verify head branch actually exists on the remote
+  try {
+    const remoteRef = run('git', ['ls-remote', '--heads', 'origin', from]);
+    if (!remoteRef) {
+      log(
+        `Branch "${from}" not found on remote origin — skipping PR to ${to}.\n` +
+        `   Ensure the branch was pushed: git push origin ${from}`,
+        'warning'
+      );
+      return;
+    }
+  } catch (e) {
+    log(`Could not verify remote branch "${from}": ${e.message}`, 'warning');
+  }
+
+  // Check for existing open PR between these branches
+  try {
+    const existing = run('gh', [
+      'pr', 'list', '--base', to, '--head', from, '--state', 'open',
+      '--json', 'url', '--jq', '.[0].url', ...repoArgs,
+    ]);
+    if (existing) {
+      log(`PR already exists for ${from} → ${to}: ${existing}`, 'warning');
+      return;
+    }
+  } catch (e) {
+    // Ignore — proceed with creation attempt
+  }
+
   log(`Creating PR ${from} → ${to}: "${title}"...`, 'loading');
 
   try {
-    exec(
-      `gh pr create --base ${to} --head ${from} --title "${title.replace(/"/g, '\\"')}" --fill`,
-      true
-    );
+    run('gh', [
+      'pr', 'create', '--base', to, '--head', from,
+      '--title', title, '--body', '', ...repoArgs,
+    ]);
     log(`PR created: ${from} → ${to}`, 'success');
   } catch (e) {
-    // PR might already exist, that's ok
-    console.log(e.message);
-    log(`PR may already exist for ${from} → ${to}`, 'warning');
+    const errMsg = (e.stderr || e.message || '').toString();
+    if (errMsg.includes('already exists')) {
+      log(`PR already exists for ${from} → ${to}`, 'warning');
+    } else if (errMsg.includes('No commits between')) {
+      log(`No new commits between ${to} and ${from} — skipping PR`, 'warning');
+    } else if (errMsg.includes('Head ref must be a branch')) {
+      log(
+        `GitHub cannot find branch "${from}" in repo ${originRepo || '(unknown)'}.\n` +
+        `   If using a fork, the --head flag may need "owner:${from}" format.\n` +
+        `   Try manually: gh pr create --base ${to} --head ${from}`,
+        'warning'
+      );
+    } else {
+      log(`Failed to create PR ${from} → ${to}: ${errMsg.split('\n').pop()}`, 'warning');
+    }
   }
-}
-
-function generatePRTitles(currentBranch, targetBranches) {
-  const titles = {};
-  for (const target of targetBranches) {
-    titles[target] = null; // Will be populated asynchronously
-  }
-  return titles;
 }
 
 // ============================================================================
@@ -602,15 +667,25 @@ async function main() {
       log('No changes to commit — will push existing commits and create PRs.', 'warning');
     }
 
-    // Generate PR titles for each target branch
-    const prTitles = {};
-    for (const target of targetBranches) {
-      const branchDiff = getDiffBetweenBranches(currentBranch, target);
-      prTitles[target] = await generatePRTitle(branchDiff, target, {
-        commitMessage,
-        currentBranch,
-      });
+    // Fetch latest remote state so origin/* refs are up-to-date for diff & PR checks
+    log('Fetching latest remote state...', 'loading');
+    try {
+      exec('git fetch --prune origin', true);
+    } catch (fetchErr) {
+      log(`Could not fetch from origin: ${fetchErr.message}`, 'warning');
     }
+
+    // Generate PR titles for each target branch (in parallel)
+    const prTitles = {};
+    await Promise.all(
+      targetBranches.map(async (target) => {
+        const branchDiff = getDiffBetweenBranches(currentBranch, target);
+        prTitles[target] = await generatePRTitle(branchDiff, target, {
+          commitMessage,
+          currentBranch,
+        });
+      })
+    );
 
     // Show preview
     const confirmed = await showPreview(
@@ -650,6 +725,26 @@ async function main() {
       log('Creating pull requests...', 'loading');
       console.log('');
       for (const target of targetBranches) {
+        // Guard: compare remote-to-remote so we check exactly what GitHub sees.
+        // origin/<currentBranch> is updated automatically by git push, so this
+        // reflects the real post-push state on the server.
+        try {
+          const remoteHead = exec(`git rev-parse origin/${currentBranch}`, true);
+          if (!remoteHead) {
+            log(`Branch ${currentBranch} not found on origin — skipping PR for ${target}`, 'warning');
+            continue;
+          }
+          const ahead = exec(`git rev-list --count origin/${target}..origin/${currentBranch}`, true);
+          if (parseInt(ahead, 10) === 0) {
+            log(`No commits ahead of origin/${target} on origin/${currentBranch} — skipping PR creation`, 'warning');
+            continue;
+          }
+        } catch (guardErr) {
+          log(`Cannot verify remote branch origin/${currentBranch}: ${guardErr.message}`, 'warning');
+          log(`Skipping PR for ${target} — ensure ${currentBranch} is pushed to origin`, 'warning');
+          continue;
+        }
+
         const prTitle = prTitles[target] || commitMessage;
         createPullRequest(currentBranch, target, prTitle);
       }
