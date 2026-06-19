@@ -547,11 +547,14 @@ function createPullRequest(from, to, title) {
   log(`Creating PR ${from} → ${to}: "${title}"...`, 'loading');
 
   try {
-    run('gh', [
+    const prUrl = run('gh', [
       'pr', 'create', '--base', to, '--head', from,
       '--title', title, '--body', '', ...repoArgs,
     ]);
     log(`PR created: ${from} → ${to}`, 'success');
+    if (prUrl) {
+      console.log(`   🔗 ${prUrl}`);
+    }
   } catch (e) {
     const errMsg = (e.stderr || e.message || '').toString();
     if (errMsg.includes('already exists')) {
