@@ -590,7 +590,7 @@ function getUserConfirmation(message) {
   });
 }
 
-async function showPreview(commitMessage, currentBranch, targetBranches, prTitles = {}, autoStage = true) {
+async function showPreview(commitMessage, currentBranch, targetBranches, prTitles = {}, autoStage = true, skipConfirm = false) {
   console.log('\n');
   console.log('╔════════════════════════════════════════════════╗');
   console.log('║         COMMIT & PR PREVIEW                     ║');
@@ -605,6 +605,11 @@ async function showPreview(commitMessage, currentBranch, targetBranches, prTitle
     console.log(`   → ${target}: ${title}`);
   }
   console.log('');
+
+  if (skipConfirm) {
+    log('Auto-confirmed (-y flag)', 'success');
+    return true;
+  }
 
   const proceed = await getUserConfirmation('Proceed? (y/n): ');
   console.log('');
@@ -643,6 +648,8 @@ async function main() {
     if (args.includes('--merge-local')) {
       autoMerge = true;
     }
+
+    const skipConfirm = args.includes('-y') || args.includes('--yes');
 
     // Welcome
     console.log('');
@@ -693,7 +700,8 @@ async function main() {
       currentBranch,
       targetBranches,
       prTitles,
-      autoStage
+      autoStage,
+      skipConfirm
     );
 
     if (!confirmed) {
