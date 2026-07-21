@@ -202,22 +202,63 @@ function getRecentCommits(count = 5) {
   return exec(`git log --oneline -${count}`, true);
 }
 
-function getDiffBetweenBranches(fromBranch, toBranch) {
+// Fetch the latest state from a remote so every origin/* tracking ref is
+// current. Returns true on success. A failure is non-fatal, but callers must
+// treat origin/* refs as potentially stale afterwards.
+function fetchRemote(remote = 'origin') {
   try {
-    // Always diff against the remote ref so we use the up-to-date branch on
-    // origin rather than a potentially stale local tracking branch.
-    const remoteRef = `origin/${toBranch}`;
-    let diff = exec(`git diff ${remoteRef}...${fromBranch}`, true);
+    run('git', ['fetch', '--prune', remote]);
+    return true;
+  } catch (err) {
+    log(`Could not fetch from ${remote}: ${err.message}`, 'warning');
+    return false;
+  }
+}
+
+// Whether a branch exists on the remote as an up-to-date tracking ref.
+// Assumes a fetch has already run, so refs/remotes/<remote>/<branch> reflects
+// the latest remote state. Uses run() (array args, no shell) so branch names
+// can never be interpreted as shell syntax.
+function remoteBranchExists(branch, remote = 'origin') {
+  try {
+    run('git', ['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}/${branch}`]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Diff a local branch against the remote target. The remote target must be
+// fresh: main() calls fetchRemote() before this, so origin/<toBranch> reflects
+// the latest state on the server rather than a stale local tracking ref.
+function getDiffBetweenBranches(fromBranch, toBranch, remote = 'origin') {
+  const remoteRef = `${remote}/${toBranch}`;
+
+  // Ensure the target actually exists on the remote and is up-to-date before
+  // diffing. Without this, a missing/stale ref yields a misleading empty or
+  // wrong diff and therefore a poor PR title, with no signal to the user.
+  if (!remoteBranchExists(toBranch, remote)) {
+    log(
+      `Target branch "${toBranch}" not found on ${remote} ` +
+      `(after fetch). PR title will fall back to commit message / branch name.`,
+      'warning'
+    );
+    return '';
+  }
+
+  try {
+    // Three-dot: changes on fromBranch since it diverged from the remote target.
+    let diff = run('git', ['diff', `${remoteRef}...${fromBranch}`]);
 
     if (!diff) {
-      // If no diff found, try two-dot diff as fallback
-      diff = exec(`git diff ${remoteRef} ${fromBranch}`, true);
+      // Fallback to a plain two-dot diff.
+      diff = run('git', ['diff', remoteRef, fromBranch]);
     }
 
     if (!diff) {
       log(
-        `No changes found between ${remoteRef} and ${fromBranch}.
-        Branch may already be merged or no commits ahead.`,
+        `No changes found between ${remoteRef} and ${fromBranch}. ` +
+        `Branch may already be merged or no commits ahead.`,
         'warning'
       );
       return '';
@@ -236,7 +277,7 @@ function getDiffBetweenBranches(fromBranch, toBranch) {
     return diff;
   } catch (err) {
     log(
-      `Could not get diff between origin/${toBranch} and ${fromBranch}: ${err.message}`,
+      `Could not get diff between ${remoteRef} and ${fromBranch}: ${err.message}`,
       'warning'
     );
     return '';
@@ -452,7 +493,7 @@ function createCommit(message) {
 function pushChanges(branch) {
   log(`Pushing to origin/${branch}...`, 'loading');
   try {
-    exec(`git push origin ${branch}`, true);
+    run('git', ['push', 'origin', branch]);
     log(`Pushed to origin/${branch}`, 'success');
   } catch (err) {
     error(
@@ -471,15 +512,15 @@ function mergeBranch(from, to) {
 
   const currentBranch = getCurrentBranch();
 
-  exec(`git checkout ${to}`, true);
-  exec('git pull --prune', true);
-  exec(`git merge ${from} --no-edit`, true);
-  exec('git push', true);
+  run('git', ['checkout', to]);
+  run('git', ['pull', '--prune']);
+  run('git', ['merge', from, '--no-edit']);
+  run('git', ['push']);
 
   log(`Merged to ${to}`, 'success');
 
   // Return to original branch
-  exec(`git checkout ${currentBranch}`, true);
+  run('git', ['checkout', currentBranch]);
 }
 
 // Parse "owner/repo" from the origin remote URL (HTTPS or SSH).
@@ -677,13 +718,11 @@ async function main() {
       log('No changes to commit — will push existing commits and create PRs.', 'warning');
     }
 
-    // Fetch latest remote state so origin/* refs are up-to-date for diff & PR checks
+    // Fetch latest remote state so origin/* refs are up-to-date for diff & PR
+    // checks. This is what makes each target branch current with the remote
+    // before generatePRTitle compares against origin/<target> below.
     log('Fetching latest remote state...', 'loading');
-    try {
-      exec('git fetch --prune origin', true);
-    } catch (fetchErr) {
-      log(`Could not fetch from origin: ${fetchErr.message}`, 'warning');
-    }
+    fetchRemote('origin');
 
     // Generate PR titles for each target branch (in parallel)
     const prTitles = {};
@@ -738,14 +777,20 @@ async function main() {
       for (const target of targetBranches) {
         // Guard: compare remote-to-remote so we check exactly what GitHub sees.
         // origin/<currentBranch> is updated automatically by git push, so this
-        // reflects the real post-push state on the server.
+        // reflects the real post-push state on the server. Uses run() (no shell)
+        // so branch names can't be interpreted as shell syntax.
         try {
-          const remoteHead = exec(`git rev-parse origin/${currentBranch}`, true);
-          if (!remoteHead) {
+          if (!remoteBranchExists(currentBranch)) {
             log(`Branch ${currentBranch} not found on origin — skipping PR for ${target}`, 'warning');
             continue;
           }
-          const ahead = exec(`git rev-list --count origin/${target}..origin/${currentBranch}`, true);
+          if (!remoteBranchExists(target)) {
+            log(`Target origin/${target} not found — skipping PR for ${target}`, 'warning');
+            continue;
+          }
+          const ahead = run('git', [
+            'rev-list', '--count', `origin/${target}..origin/${currentBranch}`,
+          ]);
           if (parseInt(ahead, 10) === 0) {
             log(`No commits ahead of origin/${target} on origin/${currentBranch} — skipping PR creation`, 'warning');
             continue;
