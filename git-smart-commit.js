@@ -4,9 +4,10 @@
  * git-smart-commit: AI-powered git commit + PR creator
  * Uses Claude API to generate meaningful commit messages based on code changes
  * 
- * Supports both:
+ * Supports:
  * - OAuth tokens (subscription-based): export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
- * - API keys (pay-per-token): export ANTHROPIC_API_KEY=sk-ant-api03-...
+ * - Anthropic API keys (pay-per-token): export ANTHROPIC_API_KEY=sk-ant-api03-...
+ * - OpenAI API keys (fallback provider): export OPENAI_API_KEY=sk-...
  * 
  * WORKFLOW:
  * 1. Generates AI commit message from code changes
@@ -35,10 +36,18 @@ const https = require('https');
 const CONFIG = {
   oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN,
   apiKey: process.env.ANTHROPIC_API_KEY,
+  openaiApiKey: process.env.OPENAI_API_KEY,
   model: 'claude-haiku-4-5-20251001',  // Optimized for classification tasks like commit messages
+  openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',  // Used when only OPENAI_API_KEY is set
   maxTokens: 500,
   defaultTargets: ['uat', 'main'],
 };
+
+// True when an Anthropic credential (OAuth token or API key) is available.
+// Anthropic takes priority; OpenAI is the fallback provider.
+function hasAnthropicAuth() {
+  return Boolean(CONFIG.oauthToken || CONFIG.apiKey);
+}
 
 // ============================================================================
 // UTILS
@@ -100,22 +109,26 @@ function checkPrerequisites() {
   // Check git
   exec('git --version', true);
 
-  // Check OAuth token or API key
-  if (!CONFIG.oauthToken && !CONFIG.apiKey) {
+  // Check OAuth token or API key (Anthropic or OpenAI)
+  if (!CONFIG.oauthToken && !CONFIG.apiKey && !CONFIG.openaiApiKey) {
     error(
-      'Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set.\n\n' +
-      'Option 1 - OAuth Token (subscription-based):\n' +
+      'No API credentials found. Set one of:\n\n' +
+      'Option 1 - Claude OAuth Token (subscription-based):\n' +
       '  export CLAUDE_CODE_OAUTH_TOKEN=$(claude setup-token)\n\n' +
-      'Option 2 - API Key (pay-per-token):\n' +
-      '  export ANTHROPIC_API_KEY=sk-ant-api03-...'
+      'Option 2 - Anthropic API Key (pay-per-token):\n' +
+      '  export ANTHROPIC_API_KEY=sk-ant-api03-...\n\n' +
+      'Option 3 - OpenAI API Key:\n' +
+      '  export OPENAI_API_KEY=sk-...'
     );
   }
 
-  // Show which auth method is being used
+  // Show which auth method is being used (Anthropic takes priority)
   if (CONFIG.oauthToken) {
-    log('Using OAuth token (subscription-based billing)', 'info');
+    log('Using Claude OAuth token (subscription-based billing)', 'info');
   } else if (CONFIG.apiKey) {
-    log('Using API key (pay-per-token billing)', 'info');
+    log('Using Anthropic API key (pay-per-token billing)', 'info');
+  } else if (CONFIG.openaiApiKey) {
+    log(`Using OpenAI API key (model: ${CONFIG.openaiModel})`, 'info');
   }
 
   // Check gh CLI (for PR creation)
@@ -352,8 +365,73 @@ function callClaudeAPI(prompt) {
   });
 }
 
+function callOpenAIAPI(prompt) {
+  return new Promise((resolve, reject) => {
+    const requestBody = JSON.stringify({
+      model: CONFIG.openaiModel,
+      max_tokens: CONFIG.maxTokens,
+      messages: [
+        {
+          role: 'user',
+          content: prompt,
+        },
+      ],
+    });
+
+    const headers = {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${CONFIG.openaiApiKey}`,
+      'Content-Length': Buffer.byteLength(requestBody),
+    };
+
+    const options = {
+      hostname: 'api.openai.com',
+      path: '/v1/chat/completions',
+      method: 'POST',
+      headers: headers,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+
+      res.on('end', () => {
+        try {
+          const response = JSON.parse(data);
+
+          if (res.statusCode !== 200) {
+            reject(new Error(response.error?.message || 'API Error'));
+            return;
+          }
+
+          const content = response.choices?.[0]?.message?.content || '';
+          resolve(content);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(requestBody);
+    req.end();
+  });
+}
+
+// Dispatch to the configured provider. Anthropic (OAuth token or API key)
+// takes priority; OpenAI is used only when no Anthropic credential is set.
+function callAI(prompt) {
+  if (hasAnthropicAuth()) {
+    return callClaudeAPI(prompt);
+  }
+  return callOpenAIAPI(prompt);
+}
+
 async function generateCommitMessage(diff, recentCommits) {
-  log('Analyzing changes with Claude...', 'loading');
+  log(`Analyzing changes with ${hasAnthropicAuth() ? 'Claude' : 'OpenAI'}...`, 'loading');
 
   const prompt = `You are a professional git commit message generator. Analyze the following code changes and generate a concise, meaningful commit message.
 
@@ -379,7 +457,7 @@ Example format: feat(auth): add login validation
 `;
 
   try {
-    const message = await callClaudeAPI(prompt);
+    const message = await callAI(prompt);
     return message.trim();
   } catch (err) {
     error(`Failed to generate commit message: ${err.message}`);
@@ -443,7 +521,7 @@ Example format: feat(auth): add login form and validation logic
 `;
 
   try {
-    const title = await callClaudeAPI(prompt);
+    const title = await callAI(prompt);
     return title.trim();
   } catch (err) {
     log(`Failed to generate PR title: ${err.message}`, 'warning');

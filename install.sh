@@ -50,21 +50,26 @@ echo "✅ Git alias 'git smartc' created"
 # Check authentication
 echo ""
 echo "🔐 Checking authentication..."
-if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
-    echo "⚠️  Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set"
+if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
+    echo "⚠️  No API credentials set"
     echo ""
-    echo "   Option 1 - OAuth Token (subscription-based):"
+    echo "   Option 1 - Claude OAuth Token (subscription-based):"
     echo "   export CLAUDE_CODE_OAUTH_TOKEN=\$(claude setup-token)"
     echo ""
-    echo "   Option 2 - API Key (pay-per-token):"
+    echo "   Option 2 - Anthropic API Key (pay-per-token):"
     echo "   export ANTHROPIC_API_KEY=sk-ant-api03-..."
+    echo ""
+    echo "   Option 3 - OpenAI API Key:"
+    echo "   export OPENAI_API_KEY=sk-..."
     echo ""
     echo "   Or add to ~/.zshrc or ~/.bashrc"
     echo ""
 elif [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
     echo "✅ CLAUDE_CODE_OAUTH_TOKEN is set"
-else
+elif [ -n "$ANTHROPIC_API_KEY" ]; then
     echo "✅ ANTHROPIC_API_KEY is set"
+else
+    echo "✅ OPENAI_API_KEY is set"
 fi
 
 # Check gh CLI
@@ -88,8 +93,9 @@ echo "╚═══════════════════════�
 echo ""
 echo "🚀 Quick Start:"
 echo "   1. Set authentication (choose one):"
-echo "      export CLAUDE_CODE_OAUTH_TOKEN=\$(claude setup-token)  # subscription"
-echo "      export ANTHROPIC_API_KEY=sk-ant-api03-...             # pay-per-token"
+echo "      export CLAUDE_CODE_OAUTH_TOKEN=\$(claude setup-token)  # Claude subscription"
+echo "      export ANTHROPIC_API_KEY=sk-ant-api03-...             # Anthropic pay-per-token"
+echo "      export OPENAI_API_KEY=sk-...                          # OpenAI"
 echo ""
 echo "   2. Try it out:"
 echo "      git smartc"
