@@ -47,17 +47,22 @@ echo "🔧 Creating git alias..."
 git config --global alias.smartc "!git-smart-commit"
 echo "✅ Git alias 'git smartc' created"
 
-# Check API key
+# Check authentication
 echo ""
-echo "🔐 Checking API key..."
-if [ -z "$ANTHROPIC_API_KEY" ]; then
-    echo "⚠️  ANTHROPIC_API_KEY not set"
+echo "🔐 Checking authentication..."
+if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -z "$ANTHROPIC_API_KEY" ]; then
+    echo "⚠️  Neither CLAUDE_CODE_OAUTH_TOKEN nor ANTHROPIC_API_KEY is set"
     echo ""
-    echo "   Set it with:"
-    echo "   export ANTHROPIC_API_KEY=sk-ant-..."
+    echo "   Option 1 - OAuth Token (subscription-based):"
+    echo "   export CLAUDE_CODE_OAUTH_TOKEN=\$(claude setup-token)"
+    echo ""
+    echo "   Option 2 - API Key (pay-per-token):"
+    echo "   export ANTHROPIC_API_KEY=sk-ant-api03-..."
     echo ""
     echo "   Or add to ~/.zshrc or ~/.bashrc"
     echo ""
+elif [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
+    echo "✅ CLAUDE_CODE_OAUTH_TOKEN is set"
 else
     echo "✅ ANTHROPIC_API_KEY is set"
 fi
@@ -82,8 +87,9 @@ echo "║         ✨ Installation Complete ✨            ║"
 echo "╚════════════════════════════════════════════════╝"
 echo ""
 echo "🚀 Quick Start:"
-echo "   1. Set API key:"
-echo "      export ANTHROPIC_API_KEY=sk-ant-..."
+echo "   1. Set authentication (choose one):"
+echo "      export CLAUDE_CODE_OAUTH_TOKEN=\$(claude setup-token)  # subscription"
+echo "      export ANTHROPIC_API_KEY=sk-ant-api03-...             # pay-per-token"
 echo ""
 echo "   2. Try it out:"
 echo "      git smartc"
