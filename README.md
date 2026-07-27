@@ -125,6 +125,21 @@ git-smart-commit --provider anthropic
 git-smart-commit --no-pr
 ```
 
+### Add Labels to Created PRs
+
+```bash
+# Single label
+git-smart-commit --label bug
+
+# Multiple labels (comma-separated, or repeat the flag)
+git-smart-commit --label bug,enhancement
+git-smart-commit -l bug -l enhancement
+```
+
+Labels are matched against the repo's existing labels (case-insensitive). Any
+label that doesn't exist in the repo is skipped with a warning and the PR is
+still created — labels never block PR creation.
+
 ### Manual Stage Mode (Commit Only Staged Files)
 
 ```bash

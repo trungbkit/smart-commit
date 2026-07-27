@@ -27,6 +27,8 @@
  *   git-smart-commit --no-stage         # Skip auto-staging
  *   git-smart-commit develop --merge-local  # Merge develop locally
  *   git-smart-commit --provider mimo    # Force MiMo provider
+ *   git-smart-commit --label bug,urgent # Add labels to created PRs
+ *                                       # (labels missing in the repo are skipped)
  */
 
 const { execSync, spawnSync } = require('child_process');
@@ -532,7 +534,56 @@ function mergeBranch(from, to) {
   exec(`git checkout ${currentBranch}`, true);
 }
 
-function createPullRequest(from, to, title) {
+function getRepoLabels() {
+  try {
+    const out = exec('gh label list --limit 500 --json name', true);
+    if (!out) {
+      return [];
+    }
+    return JSON.parse(out).map((label) => label.name);
+  } catch (e) {
+    // Repo has no labels endpoint access, gh not authenticated, or not a GitHub repo
+    return null;
+  }
+}
+
+// Keep only labels that actually exist in this repo. Anything missing is
+// dropped with a warning so PR creation still goes through.
+function resolveLabels(requestedLabels) {
+  if (!requestedLabels.length) {
+    return [];
+  }
+
+  const repoLabels = getRepoLabels();
+  if (repoLabels === null) {
+    log('Could not read repo labels. Creating PRs without labels.', 'warning');
+    return [];
+  }
+
+  const byLowerName = new Map(repoLabels.map((name) => [name.toLowerCase(), name]));
+  const found = [];
+  const missing = [];
+
+  for (const requested of requestedLabels) {
+    const match = byLowerName.get(requested.toLowerCase());
+    if (match) {
+      found.push(match);
+    } else {
+      missing.push(requested);
+    }
+  }
+
+  if (missing.length) {
+    log(
+      `Label(s) not found in this repo: ${missing.join(', ')}. Continuing without them.`,
+      'warning'
+    );
+  }
+
+  return found;
+}
+
+function createPullRequest(from, to, title, labels = []) {
   // Check if gh CLI is available
   const hasGh = exec('which gh', true);
   if (!hasGh) {
@@ -546,15 +597,29 @@ function createPullRequest(from, to, title) {
     return;
   }
 
-  log(`Creating PR ${from} → ${to}: "${title}"...`, 'loading');
+  const labelSuffix = labels.length ? ` [${labels.join(', ')}]` : '';
+  log(`Creating PR ${from} → ${to}: "${title}"${labelSuffix}...`, 'loading');
+
+  const baseCmd =
+    `gh pr create --base ${to} --head ${from} --title "${title.replace(/"/g, '\\"')}" --fill`;
+  const labelArgs = labels
+    .map((label) => ` --label "${label.replace(/"/g, '\\"')}"`)
+    .join('');
 
   try {
-    exec(
-      `gh pr create --base ${to} --head ${from} --title "${title.replace(/"/g, '\\"')}" --fill`,
-      true
-    );
-    log(`PR created: ${from} → ${to}`, 'success');
+    exec(`${baseCmd}${labelArgs}`, true);
+    log(`PR created: ${from} → ${to}${labelSuffix}`, 'success');
   } catch (e) {
+    // Retry without labels: the repo may have changed since we listed them
+    if (labels.length) {
+      try {
+        exec(baseCmd, true);
+        log(`PR created without labels: ${from} → ${to}`, 'success');
+        return;
+      } catch (retryErr) {
+        // Fall through to the shared warning below
+      }
+    }
     // PR might already exist, that's ok
     log(`PR may already exist for ${from} → ${to}`, 'warning');
   }
@@ -587,7 +652,7 @@ function getUserConfirmation(message) {
   });
 }
 
-async function showPreview(commitMessage, currentBranch, targetBranches, prTitles = {}, autoStage = true) {
+async function showPreview(commitMessage, currentBranch, targetBranches, prTitles = {}, autoStage = true, labels = []) {
   console.log('\n');
   console.log('╔════════════════════════════════════════════════╗');
   console.log('║         COMMIT & PR PREVIEW                     ║');
@@ -601,6 +666,7 @@ async function showPreview(commitMessage, currentBranch, targetBranches, prTitle
     const title = prTitles[target] || '(generating...)';
     console.log(`   → ${target}: ${title}`);
   }
+  console.log(`🏷️  PR labels: ${labels.length ? labels.join(', ') : '(none)'}`);
   console.log('');
 
   const proceed = await getUserConfirmation('Proceed? (y/n): ');
@@ -622,10 +688,11 @@ async function main() {
     let autoStage = true;  // Whether to auto-stage files
     let autoMerge = false; // Whether to merge locally after PR (only for non-protected)
     let cliProviderOverride = null;
+    const requestedLabels = [];
 
     if (args.length > 0) {
       const first = args[0];
-      if (!first.startsWith('--')) {
+      if (!first.startsWith('-')) {
         targetBranches = first.split(',');
       }
     }
@@ -637,6 +704,26 @@ async function main() {
         error('Missing value for --provider. Use: --provider mimo|anthropic');
       }
     }
+
+    // --label / -l can be repeated and accepts comma-separated values
+    args.forEach((arg, index) => {
+      if (arg !== '--label' && arg !== '-l') {
+        return;
+      }
+      const value = args[index + 1];
+      if (!value || value.startsWith('-')) {
+        error('Missing value for --label. Use: --label bug,urgent');
+      }
+      value
+        .split(',')
+        .map((label) => label.trim())
+        .filter(Boolean)
+        .forEach((label) => {
+          if (!requestedLabels.includes(label)) {
+            requestedLabels.push(label);
+          }
+        });
+    });
 
     if (args.includes('--no-pr')) {
       createPRs = false;
@@ -674,13 +761,17 @@ async function main() {
       prTitles[target] = await generatePRTitle(branchDiff, target);
     }
 
+    // Keep only labels that exist in this repo (missing ones are skipped)
+    const labels = createPRs ? resolveLabels(requestedLabels) : [];
+
     // Show preview
     const confirmed = await showPreview(
       commitMessage,
       currentBranch,
       targetBranches,
       prTitles,
-      autoStage
+      autoStage,
+      labels
     );
 
     if (!confirmed) {
@@ -709,7 +800,7 @@ async function main() {
       console.log('');
       for (const target of targetBranches) {
         const prTitle = prTitles[target] || commitMessage;
-        createPullRequest(currentBranch, target, prTitle);
+        createPullRequest(currentBranch, target, prTitle, labels);
       }
 
       console.log('');

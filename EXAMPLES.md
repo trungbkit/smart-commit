@@ -78,6 +78,24 @@ git smartc develop,main
 # - This gives reviewers better context for each target branch
 ```
 
+## Scenario 2.3: Labeling the PRs
+
+```bash
+# 1. Work on a fix that should be triaged as a bug
+git checkout bugfix/null-check
+vim src/utils/parser.js
+
+# 2. Commit + PR with labels
+git smartc --label bug,urgent
+
+# What happens:
+# - Reads the repo's label list (gh label list)
+# - "bug" exists → applied to every PR created
+# - "urgent" does not exist in this repo → skipped with a warning:
+#     ⚠️  Label(s) not found in this repo: urgent. Continuing without them.
+# - PRs are still created; a missing label never aborts the workflow
+```
+
 ## Scenario 2.5: Manual Stage Mode (Selective Commit)
 
 ```bash
