@@ -50,7 +50,7 @@ echo "✅ Git alias 'git smartc' created"
 # Check authentication
 echo ""
 echo "🔐 Checking authentication..."
-if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ]; then
+if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OPENAI_API_KEY" ] && [ -z "$GEMINI_API_KEY" ] && [ -z "$GOOGLE_API_KEY" ]; then
     echo "⚠️  No API credentials set"
     echo ""
     echo "   Option 1 - Claude OAuth Token (subscription-based):"
@@ -62,14 +62,21 @@ if [ -z "$CLAUDE_CODE_OAUTH_TOKEN" ] && [ -z "$ANTHROPIC_API_KEY" ] && [ -z "$OP
     echo "   Option 3 - OpenAI API Key:"
     echo "   export OPENAI_API_KEY=sk-..."
     echo ""
+    echo "   Option 4 - Gemini API Key:"
+    echo "   export GEMINI_API_KEY=..."
+    echo ""
     echo "   Or add to ~/.zshrc or ~/.bashrc"
     echo ""
 elif [ -n "$CLAUDE_CODE_OAUTH_TOKEN" ]; then
     echo "✅ CLAUDE_CODE_OAUTH_TOKEN is set"
 elif [ -n "$ANTHROPIC_API_KEY" ]; then
     echo "✅ ANTHROPIC_API_KEY is set"
-else
+elif [ -n "$OPENAI_API_KEY" ]; then
     echo "✅ OPENAI_API_KEY is set"
+elif [ -n "$GEMINI_API_KEY" ]; then
+    echo "✅ GEMINI_API_KEY is set"
+else
+    echo "✅ GOOGLE_API_KEY is set"
 fi
 
 # Check gh CLI
@@ -96,6 +103,7 @@ echo "   1. Set authentication (choose one):"
 echo "      export CLAUDE_CODE_OAUTH_TOKEN=\$(claude setup-token)  # Claude subscription"
 echo "      export ANTHROPIC_API_KEY=sk-ant-api03-...             # Anthropic pay-per-token"
 echo "      export OPENAI_API_KEY=sk-...                          # OpenAI"
+echo "      export GEMINI_API_KEY=...                             # Google Gemini"
 echo ""
 echo "   2. Try it out:"
 echo "      git smartc"

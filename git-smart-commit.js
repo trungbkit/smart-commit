@@ -4,11 +4,12 @@
  * git-smart-commit: AI-powered git commit + PR creator
  * Uses Claude API to generate meaningful commit messages based on code changes
  * 
- * Supports:
+ * Supports (in priority order):
  * - OAuth tokens (subscription-based): export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
  * - Anthropic API keys (pay-per-token): export ANTHROPIC_API_KEY=sk-ant-api03-...
  * - OpenAI API keys (fallback provider): export OPENAI_API_KEY=sk-...
- * 
+ * - Gemini API keys (fallback provider): export GEMINI_API_KEY=...
+ *
  * WORKFLOW:
  * 1. Generates AI commit message from code changes
  * 2. Stages & commits changes to current branch
@@ -24,6 +25,7 @@
  *   git-smart-commit --no-pr            # Commit & push, skip PR
  *   git-smart-commit --no-stage         # Skip auto-staging
  *   git-smart-commit develop --merge-local  # Merge develop locally
+ *   git-smart-commit main -y            # Skip the confirmation prompt
  */
 
 const { execSync, spawnSync } = require('child_process');
@@ -37,16 +39,32 @@ const CONFIG = {
   oauthToken: process.env.CLAUDE_CODE_OAUTH_TOKEN,
   apiKey: process.env.ANTHROPIC_API_KEY,
   openaiApiKey: process.env.OPENAI_API_KEY,
+  geminiApiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY,
   model: 'claude-haiku-4-5-20251001',  // Optimized for classification tasks like commit messages
   openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',  // Used when only OPENAI_API_KEY is set
+  geminiModel: process.env.GEMINI_MODEL || 'gemini-2.0-flash',  // Used when only a Gemini key is set
   maxTokens: 500,
   defaultTargets: ['uat', 'main'],
 };
 
 // True when an Anthropic credential (OAuth token or API key) is available.
-// Anthropic takes priority; OpenAI is the fallback provider.
+// Anthropic takes priority; OpenAI then Gemini are the fallback providers.
 function hasAnthropicAuth() {
   return Boolean(CONFIG.oauthToken || CONFIG.apiKey);
+}
+
+// The provider that will actually serve requests, resolved once from whichever
+// credentials are present. Priority: Anthropic → OpenAI → Gemini.
+function activeProvider() {
+  if (hasAnthropicAuth()) return 'anthropic';
+  if (CONFIG.openaiApiKey) return 'openai';
+  if (CONFIG.geminiApiKey) return 'gemini';
+  return null;
+}
+
+// Display name for the active provider, used in progress messages.
+function providerLabel() {
+  return { anthropic: 'Claude', openai: 'OpenAI', gemini: 'Gemini' }[activeProvider()] || 'AI';
 }
 
 // ============================================================================
@@ -109,8 +127,8 @@ function checkPrerequisites() {
   // Check git
   exec('git --version', true);
 
-  // Check OAuth token or API key (Anthropic or OpenAI)
-  if (!CONFIG.oauthToken && !CONFIG.apiKey && !CONFIG.openaiApiKey) {
+  // Check OAuth token or API key (Anthropic, OpenAI or Gemini)
+  if (!activeProvider()) {
     error(
       'No API credentials found. Set one of:\n\n' +
       'Option 1 - Claude OAuth Token (subscription-based):\n' +
@@ -118,7 +136,9 @@ function checkPrerequisites() {
       'Option 2 - Anthropic API Key (pay-per-token):\n' +
       '  export ANTHROPIC_API_KEY=sk-ant-api03-...\n\n' +
       'Option 3 - OpenAI API Key:\n' +
-      '  export OPENAI_API_KEY=sk-...'
+      '  export OPENAI_API_KEY=sk-...\n\n' +
+      'Option 4 - Gemini API Key:\n' +
+      '  export GEMINI_API_KEY=...'
     );
   }
 
@@ -129,6 +149,8 @@ function checkPrerequisites() {
     log('Using Anthropic API key (pay-per-token billing)', 'info');
   } else if (CONFIG.openaiApiKey) {
     log(`Using OpenAI API key (model: ${CONFIG.openaiModel})`, 'info');
+  } else if (CONFIG.geminiApiKey) {
+    log(`Using Gemini API key (model: ${CONFIG.geminiModel})`, 'info');
   }
 
   // Check gh CLI (for PR creation)
@@ -421,17 +443,84 @@ function callOpenAIAPI(prompt) {
   });
 }
 
+function callGeminiAPI(prompt) {
+  return new Promise((resolve, reject) => {
+    const requestBody = JSON.stringify({
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: prompt }],
+        },
+      ],
+      generationConfig: {
+        maxOutputTokens: CONFIG.maxTokens,
+      },
+    });
+
+    const headers = {
+      'Content-Type': 'application/json',
+      // Key goes in a header, not the query string, so it never lands in logs.
+      'x-goog-api-key': CONFIG.geminiApiKey,
+      'Content-Length': Buffer.byteLength(requestBody),
+    };
+
+    const options = {
+      hostname: 'generativelanguage.googleapis.com',
+      // encodeURIComponent so a user-supplied GEMINI_MODEL can't alter the path.
+      path: `/v1beta/models/${encodeURIComponent(CONFIG.geminiModel)}:generateContent`,
+      method: 'POST',
+      headers: headers,
+    };
+
+    const req = https.request(options, (res) => {
+      let data = '';
+
+      res.on('data', (chunk) => {
+        data += chunk;
+      });
+
+      res.on('end', () => {
+        try {
+          const response = JSON.parse(data);
+
+          if (res.statusCode !== 200) {
+            reject(new Error(response.error?.message || 'API Error'));
+            return;
+          }
+
+          // Gemini splits generated text across parts; join them back together.
+          const parts = response.candidates?.[0]?.content?.parts || [];
+          const content = parts.map((p) => p.text || '').join('');
+          resolve(content);
+        } catch (e) {
+          reject(e);
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.write(requestBody);
+    req.end();
+  });
+}
+
 // Dispatch to the configured provider. Anthropic (OAuth token or API key)
-// takes priority; OpenAI is used only when no Anthropic credential is set.
+// takes priority, then OpenAI, then Gemini.
 function callAI(prompt) {
-  if (hasAnthropicAuth()) {
-    return callClaudeAPI(prompt);
+  switch (activeProvider()) {
+    case 'anthropic':
+      return callClaudeAPI(prompt);
+    case 'openai':
+      return callOpenAIAPI(prompt);
+    case 'gemini':
+      return callGeminiAPI(prompt);
+    default:
+      return Promise.reject(new Error('No API credentials configured'));
   }
-  return callOpenAIAPI(prompt);
 }
 
 async function generateCommitMessage(diff, recentCommits) {
-  log(`Analyzing changes with ${hasAnthropicAuth() ? 'Claude' : 'OpenAI'}...`, 'loading');
+  log(`Analyzing changes with ${providerLabel()}...`, 'loading');
 
   const prompt = `You are a professional git commit message generator. Analyze the following code changes and generate a concise, meaningful commit message.
 
