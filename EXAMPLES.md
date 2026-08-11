@@ -34,10 +34,11 @@ git checkout bugfix/null-check
 vim src/utils/parser.js
 
 # 2. Quick commit without PR
-git smartc --no-pr
+git smartc --push-only     # aliases: --no-pr, -po, -p
 
 # What happens:
 # - Same as above but without PR creation
+# - No remote fetch and no PR-title generation — just commit & push
 # - Use when you just want to push and handle PRs manually
 ```
 
@@ -381,7 +382,7 @@ git merge --abort
 git pull origin uat
 git merge feature/my-branch
 # Resolve conflicts manually
-git smartc --no-pr  # Skip PR, just commit
+git smartc --push-only  # Skip PR, just commit & push
 ```
 
 ### Scenario: Want to edit message before committing

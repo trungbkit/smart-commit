@@ -3,7 +3,7 @@
 /**
  * git-smart-commit: AI-powered git commit + PR creator
  * Uses Claude API to generate meaningful commit messages based on code changes
- * 
+ *
  * Supports (in priority order):
  * - OAuth tokens (subscription-based): export CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-...
  * - Anthropic API keys (pay-per-token): export ANTHROPIC_API_KEY=sk-ant-api03-...
@@ -17,19 +17,20 @@
  * 4. Creates PRs to target branches (uat, main, etc.)
  * 5. For protected branches → merge via GitHub UI
  * 6. For non-protected branches → can merge locally (with --merge-local flag)
- * 
+ *
  * USAGE:
  *   git-smart-commit                    # PR to uat & main
  *   git-smart-commit staging            # PR to staging only
  *   git-smart-commit main,staging       # PR to main & staging
  *   git-smart-commit --no-pr            # Commit & push, skip PR
+ *   git-smart-commit --push-only        # Same as --no-pr (aliases: -p, -po)
  *   git-smart-commit --no-stage         # Skip auto-staging
  *   git-smart-commit develop --merge-local  # Merge develop locally
  *   git-smart-commit main -y            # Skip the confirmation prompt
  */
 
-const { execSync, spawnSync } = require('child_process');
-const https = require('https');
+const { execSync, spawnSync } = require("child_process");
+const https = require("https");
 
 // ============================================================================
 // CONFIG
@@ -40,11 +41,11 @@ const CONFIG = {
   apiKey: process.env.ANTHROPIC_API_KEY,
   openaiApiKey: process.env.OPENAI_API_KEY,
   geminiApiKey: process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY,
-  model: 'claude-haiku-4-5-20251001',  // Optimized for classification tasks like commit messages
-  openaiModel: process.env.OPENAI_MODEL || 'gpt-4o-mini',  // Used when only OPENAI_API_KEY is set
-  geminiModel: process.env.GEMINI_MODEL || 'gemini-2.0-flash',  // Used when only a Gemini key is set
+  model: "claude-haiku-4-5-20251001", // Optimized for classification tasks like commit messages
+  openaiModel: process.env.OPENAI_MODEL || "gpt-4o-mini", // Used when only OPENAI_API_KEY is set
+  geminiModel: process.env.GEMINI_MODEL || "gemini-2.0-flash", // Used when only a Gemini key is set
   maxTokens: 500,
-  defaultTargets: ['uat', 'main'],
+  defaultTargets: ["uat", "main"],
 };
 
 // True when an Anthropic credential (OAuth token or API key) is available.
@@ -56,50 +57,54 @@ function hasAnthropicAuth() {
 // The provider that will actually serve requests, resolved once from whichever
 // credentials are present. Priority: Anthropic → OpenAI → Gemini.
 function activeProvider() {
-  if (hasAnthropicAuth()) return 'anthropic';
-  if (CONFIG.openaiApiKey) return 'openai';
-  if (CONFIG.geminiApiKey) return 'gemini';
+  if (hasAnthropicAuth()) return "anthropic";
+  if (CONFIG.openaiApiKey) return "openai";
+  if (CONFIG.geminiApiKey) return "gemini";
   return null;
 }
 
 // Display name for the active provider, used in progress messages.
 function providerLabel() {
-  return { anthropic: 'Claude', openai: 'OpenAI', gemini: 'Gemini' }[activeProvider()] || 'AI';
+  return (
+    { anthropic: "Claude", openai: "OpenAI", gemini: "Gemini" }[
+      activeProvider()
+    ] || "AI"
+  );
 }
 
 // ============================================================================
 // UTILS
 // ============================================================================
 
-function log(msg, type = 'info') {
+function log(msg, type = "info") {
   const icons = {
-    info: '📋',
-    success: '✅',
-    error: '❌',
-    warning: '⚠️ ',
-    loading: '⏳',
-    arrow: '→ ',
+    info: "📋",
+    success: "✅",
+    error: "❌",
+    warning: "⚠️ ",
+    loading: "⏳",
+    arrow: "→ ",
   };
-  console.log(`${icons[type] || ''} ${msg}`);
+  console.log(`${icons[type] || ""} ${msg}`);
 }
 
 function error(msg) {
-  log(msg, 'error');
+  log(msg, "error");
   process.exit(1);
 }
 
 function exec(cmd, silent = false) {
   try {
     const result = execSync(cmd, {
-      encoding: 'utf-8',
-      stdio: silent ? 'pipe' : 'inherit',
+      encoding: "utf-8",
+      stdio: silent ? "pipe" : "inherit",
     });
-    return result ? result.trim() : '';
+    return result ? result.trim() : "";
   } catch (e) {
     if (!silent) {
       error(`Command failed: ${cmd}\n${e.message}`);
     }
-    throw e;  // Throw error instead of returning null
+    throw e; // Throw error instead of returning null
   }
 }
 
@@ -108,69 +113,71 @@ function exec(cmd, silent = false) {
 // that contain `"`, backticks, `$()`, etc. can never be interpreted as shell
 // syntax. Returns trimmed stdout; throws on non-zero exit.
 function run(file, args) {
-  const result = spawnSync(file, args, { encoding: 'utf-8' });
+  const result = spawnSync(file, args, { encoding: "utf-8" });
   if (result.error) {
     throw result.error;
   }
   if (result.status !== 0) {
-    const stderr = (result.stderr || '').trim();
-    const err = new Error(stderr || `${file} exited with code ${result.status}`);
+    const stderr = (result.stderr || "").trim();
+    const err = new Error(
+      stderr || `${file} exited with code ${result.status}`,
+    );
     err.stderr = result.stderr;
     throw err;
   }
-  return (result.stdout || '').trim();
+  return (result.stdout || "").trim();
 }
 
 function checkPrerequisites() {
-  log('Checking prerequisites...', 'loading');
+  log("Checking prerequisites...", "loading");
 
   // Check git
-  exec('git --version', true);
+  exec("git --version", true);
 
   // Check OAuth token or API key (Anthropic, OpenAI or Gemini)
   if (!activeProvider()) {
     error(
-      'No API credentials found. Set one of:\n\n' +
-      'Option 1 - Claude OAuth Token (subscription-based):\n' +
-      '  export CLAUDE_CODE_OAUTH_TOKEN=$(claude setup-token)\n\n' +
-      'Option 2 - Anthropic API Key (pay-per-token):\n' +
-      '  export ANTHROPIC_API_KEY=sk-ant-api03-...\n\n' +
-      'Option 3 - OpenAI API Key:\n' +
-      '  export OPENAI_API_KEY=sk-...\n\n' +
-      'Option 4 - Gemini API Key:\n' +
-      '  export GEMINI_API_KEY=...'
+      "No API credentials found. Set one of:\n\n" +
+        "Option 1 - Claude OAuth Token (subscription-based):\n" +
+        "  export CLAUDE_CODE_OAUTH_TOKEN=$(claude setup-token)\n\n" +
+        "Option 2 - Anthropic API Key (pay-per-token):\n" +
+        "  export ANTHROPIC_API_KEY=sk-ant-api03-...\n\n" +
+        "Option 3 - OpenAI API Key:\n" +
+        "  export OPENAI_API_KEY=sk-...\n\n" +
+        "Option 4 - Gemini API Key:\n" +
+        "  export GEMINI_API_KEY=...",
     );
   }
 
   // Show which auth method is being used (Anthropic takes priority)
   if (CONFIG.oauthToken) {
-    log('Using Claude OAuth token (subscription-based billing)', 'info');
+    log("Using Claude OAuth token (subscription-based billing)", "info");
   } else if (CONFIG.apiKey) {
-    log('Using Anthropic API key (pay-per-token billing)', 'info');
+    log("Using Anthropic API key (pay-per-token billing)", "info");
   } else if (CONFIG.openaiApiKey) {
-    log(`Using OpenAI API key (model: ${CONFIG.openaiModel})`, 'info');
+    log(`Using OpenAI API key (model: ${CONFIG.openaiModel})`, "info");
   } else if (CONFIG.geminiApiKey) {
-    log(`Using Gemini API key (model: ${CONFIG.geminiModel})`, 'info');
+    log(`Using Gemini API key (model: ${CONFIG.geminiModel})`, "info");
   }
 
   // Check gh CLI (for PR creation)
-  const hasGh = exec('which gh', true);
+  const hasGh = exec("which gh", true);
   if (!hasGh) {
     log(
-      'gh CLI not found. PR creation will be skipped.\n' +
-      'Install: brew install gh (macOS) or apt-get install gh (Linux)',
-      'warning'
+      "gh CLI not found. PR creation will be skipped.\n" +
+        "Install: brew install gh (macOS) or apt-get install gh (Linux)",
+      "warning",
     );
   }
 
-  log('Prerequisites OK', 'success');
+  log("Prerequisites OK", "success");
 }
 
 function getCurrentBranch() {
   try {
-    const branch = exec('git rev-parse --abbrev-ref HEAD', true);
-    if (branch === 'HEAD') {
-      error('Detached HEAD. Please checkout a branch first.');
+    const branch = exec("git rev-parse --abbrev-ref HEAD", true);
+    if (branch === "HEAD") {
+      error("Detached HEAD. Please checkout a branch first.");
     }
     return branch;
   } catch (err) {
@@ -179,52 +186,52 @@ function getCurrentBranch() {
 }
 
 function debugGitStatus() {
-  console.log('\n📊 Git Status Debug Info:');
-  console.log('─'.repeat(50));
-  
+  console.log("\n📊 Git Status Debug Info:");
+  console.log("─".repeat(50));
+
   try {
-    const status = exec('git status --short', true);
-    console.log('Changes to stage:');
-    console.log(status || '(no changes)');
-    
-    const config = exec('git config user.name && git config user.email', true);
-    console.log('\nGit config:');
-    console.log(config || '(not configured)');
-    
-    const remote = exec('git remote -v', true);
-    console.log('\nRemote:');
-    console.log(remote || '(no remote)');
+    const status = exec("git status --short", true);
+    console.log("Changes to stage:");
+    console.log(status || "(no changes)");
+
+    const config = exec("git config user.name && git config user.email", true);
+    console.log("\nGit config:");
+    console.log(config || "(not configured)");
+
+    const remote = exec("git remote -v", true);
+    console.log("\nRemote:");
+    console.log(remote || "(no remote)");
   } catch (err) {
-    console.log('Could not retrieve git info');
+    console.log("Could not retrieve git info");
   }
-  console.log('─'.repeat(50) + '\n');
+  console.log("─".repeat(50) + "\n");
 }
 
 function getGitDiff() {
   try {
     // Get staged changes first
-    let diff = exec('git diff --cached', true);
+    let diff = exec("git diff --cached", true);
 
     // If nothing staged, get all changes
     if (!diff) {
-      diff = exec('git diff', true);
+      diff = exec("git diff", true);
     }
 
     if (!diff) {
       // No uncommitted changes. Don't abort — the caller may still want to
       // push existing commits and open a PR. Signal "nothing to commit" by
       // returning an empty string.
-      return '';
+      return "";
     }
 
     // Limit diff size to avoid token limits (max 5000 lines)
-    const lines = diff.split('\n');
+    const lines = diff.split("\n");
     if (lines.length > 5000) {
       log(
         `Large diff (${lines.length} lines). Truncating to 5000 lines for analysis.`,
-        'warning'
+        "warning",
       );
-      diff = lines.slice(0, 5000).join('\n');
+      diff = lines.slice(0, 5000).join("\n");
     }
 
     return diff;
@@ -240,12 +247,12 @@ function getRecentCommits(count = 5) {
 // Fetch the latest state from a remote so every origin/* tracking ref is
 // current. Returns true on success. A failure is non-fatal, but callers must
 // treat origin/* refs as potentially stale afterwards.
-function fetchRemote(remote = 'origin') {
+function fetchRemote(remote = "origin") {
   try {
-    run('git', ['fetch', '--prune', remote]);
+    run("git", ["fetch", "--prune", remote]);
     return true;
   } catch (err) {
-    log(`Could not fetch from ${remote}: ${err.message}`, 'warning');
+    log(`Could not fetch from ${remote}: ${err.message}`, "warning");
     return false;
   }
 }
@@ -254,9 +261,14 @@ function fetchRemote(remote = 'origin') {
 // Assumes a fetch has already run, so refs/remotes/<remote>/<branch> reflects
 // the latest remote state. Uses run() (array args, no shell) so branch names
 // can never be interpreted as shell syntax.
-function remoteBranchExists(branch, remote = 'origin') {
+function remoteBranchExists(branch, remote = "origin") {
   try {
-    run('git', ['rev-parse', '--verify', '--quiet', `refs/remotes/${remote}/${branch}`]);
+    run("git", [
+      "rev-parse",
+      "--verify",
+      "--quiet",
+      `refs/remotes/${remote}/${branch}`,
+    ]);
     return true;
   } catch {
     return false;
@@ -266,7 +278,7 @@ function remoteBranchExists(branch, remote = 'origin') {
 // Diff a local branch against the remote target. The remote target must be
 // fresh: main() calls fetchRemote() before this, so origin/<toBranch> reflects
 // the latest state on the server rather than a stale local tracking ref.
-function getDiffBetweenBranches(fromBranch, toBranch, remote = 'origin') {
+function getDiffBetweenBranches(fromBranch, toBranch, remote = "origin") {
   const remoteRef = `${remote}/${toBranch}`;
 
   // Ensure the target actually exists on the remote and is up-to-date before
@@ -275,47 +287,47 @@ function getDiffBetweenBranches(fromBranch, toBranch, remote = 'origin') {
   if (!remoteBranchExists(toBranch, remote)) {
     log(
       `Target branch "${toBranch}" not found on ${remote} ` +
-      `(after fetch). PR title will fall back to commit message / branch name.`,
-      'warning'
+        `(after fetch). PR title will fall back to commit message / branch name.`,
+      "warning",
     );
-    return '';
+    return "";
   }
 
   try {
     // Three-dot: changes on fromBranch since it diverged from the remote target.
-    let diff = run('git', ['diff', `${remoteRef}...${fromBranch}`]);
+    let diff = run("git", ["diff", `${remoteRef}...${fromBranch}`]);
 
     if (!diff) {
       // Fallback to a plain two-dot diff.
-      diff = run('git', ['diff', remoteRef, fromBranch]);
+      diff = run("git", ["diff", remoteRef, fromBranch]);
     }
 
     if (!diff) {
       log(
         `No changes found between ${remoteRef} and ${fromBranch}. ` +
-        `Branch may already be merged or no commits ahead.`,
-        'warning'
+          `Branch may already be merged or no commits ahead.`,
+        "warning",
       );
-      return '';
+      return "";
     }
 
     // Limit diff size to avoid token limits (max 8000 lines)
-    const lines = diff.split('\n');
+    const lines = diff.split("\n");
     if (lines.length > 8000) {
       log(
         `Large diff (${lines.length} lines). Truncating to 8000 lines for analysis.`,
-        'warning'
+        "warning",
       );
-      diff = lines.slice(0, 8000).join('\n');
+      diff = lines.slice(0, 8000).join("\n");
     }
 
     return diff;
   } catch (err) {
     log(
       `Could not get diff between ${remoteRef} and ${fromBranch}: ${err.message}`,
-      'warning'
+      "warning",
     );
-    return '';
+    return "";
   }
 }
 
@@ -330,7 +342,7 @@ function callClaudeAPI(prompt) {
       max_tokens: CONFIG.maxTokens,
       messages: [
         {
-          role: 'user',
+          role: "user",
           content: prompt,
         },
       ],
@@ -338,42 +350,42 @@ function callClaudeAPI(prompt) {
 
     // Build headers with appropriate authentication
     const headers = {
-      'Content-Type': 'application/json',
-      'anthropic-version': '2023-06-01',
-      'Content-Length': Buffer.byteLength(requestBody),
+      "Content-Type": "application/json",
+      "anthropic-version": "2023-06-01",
+      "Content-Length": Buffer.byteLength(requestBody),
     };
 
     // Add authentication header (OAuth or API key)
     if (CONFIG.oauthToken) {
-      headers['Authorization'] = `Bearer ${CONFIG.oauthToken}`;
+      headers["Authorization"] = `Bearer ${CONFIG.oauthToken}`;
     } else if (CONFIG.apiKey) {
-      headers['x-api-key'] = CONFIG.apiKey;
+      headers["x-api-key"] = CONFIG.apiKey;
     }
 
     const options = {
-      hostname: 'api.anthropic.com',
-      path: '/v1/messages',
-      method: 'POST',
+      hostname: "api.anthropic.com",
+      path: "/v1/messages",
+      method: "POST",
       headers: headers,
     };
 
     const req = https.request(options, (res) => {
-      let data = '';
+      let data = "";
 
-      res.on('data', (chunk) => {
+      res.on("data", (chunk) => {
         data += chunk;
       });
 
-      res.on('end', () => {
+      res.on("end", () => {
         try {
           const response = JSON.parse(data);
 
           if (res.statusCode !== 200) {
-            reject(new Error(response.error?.message || 'API Error'));
+            reject(new Error(response.error?.message || "API Error"));
             return;
           }
 
-          const content = response.content[0]?.text || '';
+          const content = response.content[0]?.text || "";
           resolve(content);
         } catch (e) {
           reject(e);
@@ -381,7 +393,7 @@ function callClaudeAPI(prompt) {
       });
     });
 
-    req.on('error', reject);
+    req.on("error", reject);
     req.write(requestBody);
     req.end();
   });
@@ -394,42 +406,42 @@ function callOpenAIAPI(prompt) {
       max_tokens: CONFIG.maxTokens,
       messages: [
         {
-          role: 'user',
+          role: "user",
           content: prompt,
         },
       ],
     });
 
     const headers = {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${CONFIG.openaiApiKey}`,
-      'Content-Length': Buffer.byteLength(requestBody),
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${CONFIG.openaiApiKey}`,
+      "Content-Length": Buffer.byteLength(requestBody),
     };
 
     const options = {
-      hostname: 'api.openai.com',
-      path: '/v1/chat/completions',
-      method: 'POST',
+      hostname: "api.openai.com",
+      path: "/v1/chat/completions",
+      method: "POST",
       headers: headers,
     };
 
     const req = https.request(options, (res) => {
-      let data = '';
+      let data = "";
 
-      res.on('data', (chunk) => {
+      res.on("data", (chunk) => {
         data += chunk;
       });
 
-      res.on('end', () => {
+      res.on("end", () => {
         try {
           const response = JSON.parse(data);
 
           if (res.statusCode !== 200) {
-            reject(new Error(response.error?.message || 'API Error'));
+            reject(new Error(response.error?.message || "API Error"));
             return;
           }
 
-          const content = response.choices?.[0]?.message?.content || '';
+          const content = response.choices?.[0]?.message?.content || "";
           resolve(content);
         } catch (e) {
           reject(e);
@@ -437,7 +449,7 @@ function callOpenAIAPI(prompt) {
       });
     });
 
-    req.on('error', reject);
+    req.on("error", reject);
     req.write(requestBody);
     req.end();
   });
@@ -448,7 +460,7 @@ function callGeminiAPI(prompt) {
     const requestBody = JSON.stringify({
       contents: [
         {
-          role: 'user',
+          role: "user",
           parts: [{ text: prompt }],
         },
       ],
@@ -458,39 +470,39 @@ function callGeminiAPI(prompt) {
     });
 
     const headers = {
-      'Content-Type': 'application/json',
+      "Content-Type": "application/json",
       // Key goes in a header, not the query string, so it never lands in logs.
-      'x-goog-api-key': CONFIG.geminiApiKey,
-      'Content-Length': Buffer.byteLength(requestBody),
+      "x-goog-api-key": CONFIG.geminiApiKey,
+      "Content-Length": Buffer.byteLength(requestBody),
     };
 
     const options = {
-      hostname: 'generativelanguage.googleapis.com',
+      hostname: "generativelanguage.googleapis.com",
       // encodeURIComponent so a user-supplied GEMINI_MODEL can't alter the path.
       path: `/v1beta/models/${encodeURIComponent(CONFIG.geminiModel)}:generateContent`,
-      method: 'POST',
+      method: "POST",
       headers: headers,
     };
 
     const req = https.request(options, (res) => {
-      let data = '';
+      let data = "";
 
-      res.on('data', (chunk) => {
+      res.on("data", (chunk) => {
         data += chunk;
       });
 
-      res.on('end', () => {
+      res.on("end", () => {
         try {
           const response = JSON.parse(data);
 
           if (res.statusCode !== 200) {
-            reject(new Error(response.error?.message || 'API Error'));
+            reject(new Error(response.error?.message || "API Error"));
             return;
           }
 
           // Gemini splits generated text across parts; join them back together.
           const parts = response.candidates?.[0]?.content?.parts || [];
-          const content = parts.map((p) => p.text || '').join('');
+          const content = parts.map((p) => p.text || "").join("");
           resolve(content);
         } catch (e) {
           reject(e);
@@ -498,7 +510,7 @@ function callGeminiAPI(prompt) {
       });
     });
 
-    req.on('error', reject);
+    req.on("error", reject);
     req.write(requestBody);
     req.end();
   });
@@ -508,19 +520,19 @@ function callGeminiAPI(prompt) {
 // takes priority, then OpenAI, then Gemini.
 function callAI(prompt) {
   switch (activeProvider()) {
-    case 'anthropic':
+    case "anthropic":
       return callClaudeAPI(prompt);
-    case 'openai':
+    case "openai":
       return callOpenAIAPI(prompt);
-    case 'gemini':
+    case "gemini":
       return callGeminiAPI(prompt);
     default:
-      return Promise.reject(new Error('No API credentials configured'));
+      return Promise.reject(new Error("No API credentials configured"));
   }
 }
 
 async function generateCommitMessage(diff, recentCommits) {
-  log(`Analyzing changes with ${providerLabel()}...`, 'loading');
+  log(`Analyzing changes with ${providerLabel()}...`, "loading");
 
   const prompt = `You are a professional git commit message generator. Analyze the following code changes and generate a concise, meaningful commit message.
 
@@ -559,7 +571,9 @@ Example format: feat(auth): add login validation
 function buildHumanPRTitle(targetBranch, commitMessage, currentBranch) {
   if (commitMessage) {
     // Drop the conventional-commit prefix (e.g. "feat(auth): ") for readability.
-    const summary = commitMessage.replace(/^[a-z]+(\([^)]*\))?!?:\s*/i, '').trim();
+    const summary = commitMessage
+      .replace(/^[a-z]+(\([^)]*\))?!?:\s*/i, "")
+      .trim();
     if (summary) {
       const sentence = summary.charAt(0).toUpperCase() + summary.slice(1);
       return `${sentence} (→ ${targetBranch})`;
@@ -569,8 +583,8 @@ function buildHumanPRTitle(targetBranch, commitMessage, currentBranch) {
   if (currentBranch) {
     // Turn "feature/login-form" into "Login form".
     const readable = currentBranch
-      .replace(/^(feature|feat|fix|bugfix|hotfix|chore|release|docs)\//i, '')
-      .replace(/[-_/]+/g, ' ')
+      .replace(/^(feature|feat|fix|bugfix|hotfix|chore|release|docs)\//i, "")
+      .replace(/[-_/]+/g, " ")
       .trim();
     if (readable) {
       const sentence = readable.charAt(0).toUpperCase() + readable.slice(1);
@@ -581,14 +595,22 @@ function buildHumanPRTitle(targetBranch, commitMessage, currentBranch) {
   return `Merge changes into ${targetBranch}`;
 }
 
-async function generatePRTitle(diff, targetBranch, { commitMessage, currentBranch } = {}) {
-  const humanFallback = buildHumanPRTitle(targetBranch, commitMessage, currentBranch);
+async function generatePRTitle(
+  diff,
+  targetBranch,
+  { commitMessage, currentBranch } = {},
+) {
+  const humanFallback = buildHumanPRTitle(
+    targetBranch,
+    commitMessage,
+    currentBranch,
+  );
 
   if (!diff) {
     return humanFallback;
   }
 
-  log(`Generating PR title for ${targetBranch}...`, 'loading');
+  log(`Generating PR title for ${targetBranch}...`, "loading");
 
   const prompt = `You are a professional pull request title generator. Analyze the following code changes and generate a concise, meaningful PR title that summarizes all changes.
 
@@ -613,7 +635,7 @@ Example format: feat(auth): add login form and validation logic
     const title = await callAI(prompt);
     return title.trim();
   } catch (err) {
-    log(`Failed to generate PR title: ${err.message}`, 'warning');
+    log(`Failed to generate PR title: ${err.message}`, "warning");
     return humanFallback;
   }
 }
@@ -623,78 +645,79 @@ Example format: feat(auth): add login form and validation logic
 // ============================================================================
 
 function stageChanges() {
-  log('Staging changes...', 'loading');
+  log("Staging changes...", "loading");
   try {
-    exec('git add .', true);
-    log('Changes staged', 'success');
+    exec("git add .", true);
+    log("Changes staged", "success");
   } catch (err) {
     error(
       `Failed to stage changes: ${err.message}\n\n` +
-      'Troubleshooting:\n' +
-      '1. Check git status: git status\n' +
-      '2. Verify you have changes to stage\n' +
-      '3. Check file permissions: ls -la\n' +
-      '4. Try: git add . manually first'
+        "Troubleshooting:\n" +
+        "1. Check git status: git status\n" +
+        "2. Verify you have changes to stage\n" +
+        "3. Check file permissions: ls -la\n" +
+        "4. Try: git add . manually first",
     );
   }
 }
 
 function createCommit(message) {
-  log(`Creating commit: "${message}"`, 'loading');
+  log(`Creating commit: "${message}"`, "loading");
   try {
-    run('git', ['commit', '-m', message]);
-    log('Commit created', 'success');
+    run("git", ["commit", "-m", message]);
+    log("Commit created", "success");
     return message;
   } catch (err) {
     error(
       `Failed to create commit: ${err.message}\n\n` +
-      'Troubleshooting:\n' +
-      '1. Verify changes are staged: git status\n' +
-      '2. Check git config: git config user.name && git config user.email\n' +
-      '3. Try staging manually: git add .\n' +
-      '4. Try committing manually: git commit -m "your message"'
+        "Troubleshooting:\n" +
+        "1. Verify changes are staged: git status\n" +
+        "2. Check git config: git config user.name && git config user.email\n" +
+        "3. Try staging manually: git add .\n" +
+        '4. Try committing manually: git commit -m "your message"',
     );
   }
 }
 
 function pushChanges(branch) {
-  log(`Pushing to origin/${branch}...`, 'loading');
+  log(`Pushing to origin/${branch}...`, "loading");
   try {
-    run('git', ['push', 'origin', branch]);
-    log(`Pushed to origin/${branch}`, 'success');
+    run("git", ["push", "-u", "origin", branch]);
+    log(`Pushed to origin/${branch}`, "success");
   } catch (err) {
     error(
       `Failed to push: ${err.message}\n\n` +
-      'Troubleshooting:\n' +
-      '1. Check network connection\n' +
-      '2. Verify remote: git remote -v\n' +
-      '3. Check if branch exists remotely\n' +
-      '4. Try: git push -u origin ' + branch
+        "Troubleshooting:\n" +
+        "1. Check network connection\n" +
+        "2. Verify remote: git remote -v\n" +
+        "3. Check if branch exists remotely\n" +
+        "4. Try: git push -u origin " +
+        branch,
     );
   }
 }
 
 function mergeBranch(from, to) {
-  log(`Merging ${from} → ${to}...`, 'arrow');
+  log(`Merging ${from} → ${to}...`, "arrow");
 
   const currentBranch = getCurrentBranch();
 
-  run('git', ['checkout', to]);
-  run('git', ['pull', '--prune']);
-  run('git', ['merge', from, '--no-edit']);
-  run('git', ['push']);
+  run("git", ["checkout", to]);
+  run("git", ["pull", "--prune"]);
+  run("git", ["merge", from, "--no-edit"]);
+  run("git", ["push"]);
 
-  log(`Merged to ${to}`, 'success');
+  log(`Merged to ${to}`, "success");
 
   // Return to original branch
-  run('git', ['checkout', currentBranch]);
+  run("git", ["checkout", currentBranch]);
 }
 
 // Parse "owner/repo" from the origin remote URL (HTTPS or SSH).
 // Uses the push URL, which may differ from the fetch URL in fork setups.
 function getOriginRepo() {
   try {
-    const url = exec('git remote get-url --push origin', true);
+    const url = exec("git remote get-url --push origin", true);
     const match = url.match(/github\.com[:/]([^/]+\/[^/.]+)/);
     return match ? match[1] : null;
   } catch {
@@ -704,80 +727,103 @@ function getOriginRepo() {
 
 function createPullRequest(from, to, title) {
   // Strip "origin/" remote prefix only — preserve branch namespaces like "mch/feature"
-  from = from.replace(/^origin\//, '');
-  to = to.replace(/^origin\//, '');
+  from = from.replace(/^origin\//, "");
+  to = to.replace(/^origin\//, "");
 
   // Check if gh CLI is available
-  const hasGh = exec('which gh', true);
+  const hasGh = exec("which gh", true);
   if (!hasGh) {
     log(
       `To create PR automatically, install gh CLI:\n` +
-      `  brew install gh  # macOS\n` +
-      `  apt-get install gh  # Linux\n` +
-      `Then run: git-smart-commit --with-pr`,
-      'warning'
+        `  brew install gh  # macOS\n` +
+        `  apt-get install gh  # Linux\n` +
+        `Then run: git-smart-commit --with-pr`,
+      "warning",
     );
     return;
   }
 
   const originRepo = getOriginRepo();
-  const repoArgs = originRepo ? ['--repo', originRepo] : [];
+  const repoArgs = originRepo ? ["--repo", originRepo] : [];
 
   // Verify head branch actually exists on the remote
   try {
-    const remoteRef = run('git', ['ls-remote', '--heads', 'origin', from]);
+    const remoteRef = run("git", ["ls-remote", "--heads", "origin", from]);
     if (!remoteRef) {
       log(
         `Branch "${from}" not found on remote origin — skipping PR to ${to}.\n` +
-        `   Ensure the branch was pushed: git push origin ${from}`,
-        'warning'
+          `   Ensure the branch was pushed: git push origin ${from}`,
+        "warning",
       );
       return;
     }
   } catch (e) {
-    log(`Could not verify remote branch "${from}": ${e.message}`, 'warning');
+    log(`Could not verify remote branch "${from}": ${e.message}`, "warning");
   }
 
   // Check for existing open PR between these branches
   try {
-    const existing = run('gh', [
-      'pr', 'list', '--base', to, '--head', from, '--state', 'open',
-      '--json', 'url', '--jq', '.[0].url', ...repoArgs,
+    const existing = run("gh", [
+      "pr",
+      "list",
+      "--base",
+      to,
+      "--head",
+      from,
+      "--state",
+      "open",
+      "--json",
+      "url",
+      "--jq",
+      ".[0].url",
+      ...repoArgs,
     ]);
     if (existing) {
-      log(`PR already exists for ${from} → ${to}: ${existing}`, 'warning');
+      log(`PR already exists for ${from} → ${to}: ${existing}`, "warning");
       return;
     }
   } catch (e) {
     // Ignore — proceed with creation attempt
   }
 
-  log(`Creating PR ${from} → ${to}: "${title}"...`, 'loading');
+  log(`Creating PR ${from} → ${to}: "${title}"...`, "loading");
 
   try {
-    const prUrl = run('gh', [
-      'pr', 'create', '--base', to, '--head', from,
-      '--title', title, '--body', '', ...repoArgs,
+    const prUrl = run("gh", [
+      "pr",
+      "create",
+      "--base",
+      to,
+      "--head",
+      from,
+      "--title",
+      title,
+      "--body",
+      "",
+      ...repoArgs,
     ]);
-    log(`PR created: ${from} → ${to}`, 'success');
+    log(`PR created: ${from} → ${to}`, "success");
     if (prUrl) {
       console.log(`   🔗 ${prUrl}`);
     }
   } catch (e) {
-    const errMsg = (e.stderr || e.message || '').toString();
-    if (errMsg.includes('already exists')) {
-      log(`PR already exists for ${from} → ${to}`, 'warning');
-    } else if (errMsg.includes('No commits between')) {
-      log(`No new commits between ${to} and ${from} — skipping PR`, 'warning');
-    } else if (errMsg.includes('Head ref must be a branch')) {
+    const errMsg = (e.stderr || e.message || "").toString();
+    if (errMsg.includes("already exists")) {
+      log(`PR already exists for ${from} → ${to}`, "warning");
+    } else if (errMsg.includes("No commits between")) {
+      log(`No new commits between ${to} and ${from} — skipping PR`, "warning");
+    } else if (errMsg.includes("Head ref must be a branch")) {
       log(
-        `GitHub cannot find branch "${from}" in repo ${originRepo || '(unknown)'}.\n` +
-        `   If using a fork, the --head flag may need "owner:${from}" format.\n` +
-        `   Try manually: gh pr create --base ${to} --head ${from}`,
-        'warning'
+        `GitHub cannot find branch "${from}" in repo ${originRepo || "(unknown)"}.\n` +
+          `   If using a fork, the --head flag may need "owner:${from}" format.\n` +
+          `   Try manually: gh pr create --base ${to} --head ${from}`,
+        "warning",
       );
     } else {
-      log(`Failed to create PR ${from} → ${to}: ${errMsg.split('\n').pop()}`, 'warning');
+      log(
+        `Failed to create PR ${from} → ${to}: ${errMsg.split("\n").pop()}`,
+        "warning",
+      );
     }
   }
 }
@@ -787,7 +833,7 @@ function createPullRequest(from, to, title) {
 // ============================================================================
 
 function getUserConfirmation(message) {
-  const readline = require('readline');
+  const readline = require("readline");
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -796,34 +842,56 @@ function getUserConfirmation(message) {
   return new Promise((resolve) => {
     rl.question(message, (answer) => {
       rl.close();
-      resolve(answer.toLowerCase() === 'y' || answer.toLowerCase() === 'yes');
+      resolve(answer.toLowerCase() === "y" || answer.toLowerCase() === "yes");
     });
   });
 }
 
-async function showPreview(commitMessage, currentBranch, targetBranches, prTitles = {}, autoStage = true, skipConfirm = false) {
-  console.log('\n');
-  console.log('╔════════════════════════════════════════════════╗');
-  console.log('║         COMMIT & PR PREVIEW                     ║');
-  console.log('╚════════════════════════════════════════════════╝');
-  console.log('');
+async function showPreview(
+  commitMessage,
+  currentBranch,
+  targetBranches,
+  prTitles = {},
+  autoStage = true,
+  skipConfirm = false,
+  createPRs = true,
+) {
+  console.log("\n");
+  console.log("╔════════════════════════════════════════════════╗");
+  console.log(
+    createPRs
+      ? "║         COMMIT & PR PREVIEW                     ║"
+      : "║         COMMIT & PUSH PREVIEW                   ║",
+  );
+  console.log("╚════════════════════════════════════════════════╝");
+  console.log("");
   console.log(`📌 Current branch: ${currentBranch}`);
-  console.log(`${autoStage ? '📦' : '⏭️ '} Stage mode: ${autoStage ? 'AUTO (all files)' : 'MANUAL (staged only)'}`);
-  console.log(`💬 Commit message: ${commitMessage || '(none — no new changes, push & PR only)'}`);
-  console.log(`📊 Target branches & PR titles:`);
-  for (const target of targetBranches) {
-    const title = prTitles[target] || '(generating...)';
-    console.log(`   → ${target}: ${title}`);
+  console.log(
+    `${autoStage ? "📦" : "⏭️ "} Stage mode: ${autoStage ? "AUTO (all files)" : "MANUAL (staged only)"}`,
+  );
+  const noCommitNote = createPRs
+    ? "(none — no new changes, push & PR only)"
+    : "(none — no new changes, push only)";
+  console.log(`💬 Commit message: ${commitMessage || noCommitNote}`);
+  if (createPRs) {
+    console.log(`📊 Target branches & PR titles:`);
+    for (const target of targetBranches) {
+      const title = prTitles[target] || "(generating...)";
+      console.log(`   → ${target}: ${title}`);
+    }
+  } else {
+    console.log(`🚫 PR creation: SKIPPED (commit & push only)`);
+    console.log(`   → Pushing to origin/${currentBranch}`);
   }
-  console.log('');
+  console.log("");
 
   if (skipConfirm) {
-    log('Auto-confirmed (-y flag)', 'success');
+    log("Auto-confirmed (-y flag)", "success");
     return true;
   }
 
-  const proceed = await getUserConfirmation('Proceed? (y/n): ');
-  console.log('');
+  const proceed = await getUserConfirmation("Proceed? (y/n): ");
+  console.log("");
 
   return proceed;
 }
@@ -838,38 +906,53 @@ async function main() {
     const args = process.argv.slice(2);
     let targetBranches = CONFIG.defaultTargets;
     let createPRs = true;
-    let autoStage = true;  // Whether to auto-stage files
+    let autoStage = true; // Whether to auto-stage files
     let autoMerge = false; // Whether to merge locally after PR (only for non-protected)
 
     if (args.length > 0) {
       const first = args[0];
-      if (!first.startsWith('--')) {
-        targetBranches = first.split(',');
+      // Any dash-prefixed leading arg is a flag, not a target list — short
+      // flags included (-y, -ns, -p), which would otherwise be read as a
+      // branch name.
+      if (!first.startsWith("-")) {
+        targetBranches = first.split(",");
       }
     }
 
-    if (args.includes('--no-pr')) {
+    // Commit & push only — no PR. --push-only (and its short forms) are
+    // aliases for --no-pr, named for what the run actually does.
+    if (
+      args.includes("--no-pr") ||
+      args.includes("--push-only") ||
+      args.includes("-po") ||
+      args.includes("-p")
+    ) {
       createPRs = false;
     }
 
-    if (args.includes('--no-stage') || args.includes('-ns')) {
+    if (args.includes("--no-stage") || args.includes("-ns")) {
       autoStage = false;
     }
 
-    if (args.includes('--merge-local')) {
+    if (args.includes("--merge-local")) {
       autoMerge = true;
     }
 
-    const skipConfirm = args.includes('-y') || args.includes('--yes');
+    // Local merging happens in the PR stage, so it can't run in push-only mode.
+    if (autoMerge && !createPRs) {
+      log("--merge-local has no effect without PR creation", "warning");
+    }
+
+    const skipConfirm = args.includes("-y") || args.includes("--yes");
 
     // Welcome
-    console.log('');
-    log('Git Smart Commit - AI-Powered Workflow', 'info');
-    console.log('');
+    console.log("");
+    log("Git Smart Commit - AI-Powered Workflow", "info");
+    console.log("");
 
     // Prerequisites
     checkPrerequisites();
-    console.log('');
+    console.log("");
 
     // Get current state
     const currentBranch = getCurrentBranch();
@@ -882,26 +965,35 @@ async function main() {
     if (hasChanges) {
       commitMessage = await generateCommitMessage(diff, recentCommits);
     } else {
-      log('No changes to commit — will push existing commits and create PRs.', 'warning');
+      log(
+        createPRs
+          ? "No changes to commit — will push existing commits and create PRs."
+          : "No changes to commit — will push existing commits only.",
+        "warning",
+      );
     }
 
-    // Fetch latest remote state so origin/* refs are up-to-date for diff & PR
-    // checks. This is what makes each target branch current with the remote
-    // before generatePRTitle compares against origin/<target> below.
-    log('Fetching latest remote state...', 'loading');
-    fetchRemote('origin');
-
-    // Generate PR titles for each target branch (in parallel)
+    // Push-only mode never touches the targets, so skip the fetch and the
+    // per-target AI calls entirely instead of generating titles we discard.
     const prTitles = {};
-    await Promise.all(
-      targetBranches.map(async (target) => {
-        const branchDiff = getDiffBetweenBranches(currentBranch, target);
-        prTitles[target] = await generatePRTitle(branchDiff, target, {
-          commitMessage,
-          currentBranch,
-        });
-      })
-    );
+    if (createPRs) {
+      // Fetch latest remote state so origin/* refs are up-to-date for diff & PR
+      // checks. This is what makes each target branch current with the remote
+      // before generatePRTitle compares against origin/<target> below.
+      log("Fetching latest remote state...", "loading");
+      fetchRemote("origin");
+
+      // Generate PR titles for each target branch (in parallel)
+      await Promise.all(
+        targetBranches.map(async (target) => {
+          const branchDiff = getDiffBetweenBranches(currentBranch, target);
+          prTitles[target] = await generatePRTitle(branchDiff, target, {
+            commitMessage,
+            currentBranch,
+          });
+        }),
+      );
+    }
 
     // Show preview
     const confirmed = await showPreview(
@@ -910,37 +1002,38 @@ async function main() {
       targetBranches,
       prTitles,
       autoStage,
-      skipConfirm
+      skipConfirm,
+      createPRs,
     );
 
     if (!confirmed) {
-      log('Aborted', 'error');
+      log("Aborted", "error");
       process.exit(0);
     }
 
     // Execute workflow
-    console.log('');
-    log('Executing workflow...', 'loading');
-    console.log('');
+    console.log("");
+    log("Executing workflow...", "loading");
+    console.log("");
 
     if (hasChanges) {
       if (autoStage) {
         stageChanges();
       } else {
-        log('Skipping auto-stage (use --no-stage)', 'warning');
+        log("Skipping auto-stage (use --no-stage)", "warning");
         debugGitStatus();
       }
       createCommit(commitMessage);
     } else {
-      log('No changes to commit — skipping stage & commit.', 'info');
+      log("No changes to commit — skipping stage & commit.", "info");
     }
     pushChanges(currentBranch);
 
     // Create PRs
     if (createPRs) {
-      console.log('');
-      log('Creating pull requests...', 'loading');
-      console.log('');
+      console.log("");
+      log("Creating pull requests...", "loading");
+      console.log("");
       for (const target of targetBranches) {
         // Guard: compare remote-to-remote so we check exactly what GitHub sees.
         // origin/<currentBranch> is updated automatically by git push, so this
@@ -948,78 +1041,105 @@ async function main() {
         // so branch names can't be interpreted as shell syntax.
         try {
           if (!remoteBranchExists(currentBranch)) {
-            log(`Branch ${currentBranch} not found on origin — skipping PR for ${target}`, 'warning');
+            log(
+              `Branch ${currentBranch} not found on origin — skipping PR for ${target}`,
+              "warning",
+            );
             continue;
           }
           if (!remoteBranchExists(target)) {
-            log(`Target origin/${target} not found — skipping PR for ${target}`, 'warning');
+            log(
+              `Target origin/${target} not found — skipping PR for ${target}`,
+              "warning",
+            );
             continue;
           }
-          const ahead = run('git', [
-            'rev-list', '--count', `origin/${target}..origin/${currentBranch}`,
+          const ahead = run("git", [
+            "rev-list",
+            "--count",
+            `origin/${target}..origin/${currentBranch}`,
           ]);
           if (parseInt(ahead, 10) === 0) {
-            log(`No commits ahead of origin/${target} on origin/${currentBranch} — skipping PR creation`, 'warning');
+            log(
+              `No commits ahead of origin/${target} on origin/${currentBranch} — skipping PR creation`,
+              "warning",
+            );
             continue;
           }
         } catch (guardErr) {
-          log(`Cannot verify remote branch origin/${currentBranch}: ${guardErr.message}`, 'warning');
-          log(`Skipping PR for ${target} — ensure ${currentBranch} is pushed to origin`, 'warning');
+          log(
+            `Cannot verify remote branch origin/${currentBranch}: ${guardErr.message}`,
+            "warning",
+          );
+          log(
+            `Skipping PR for ${target} — ensure ${currentBranch} is pushed to origin`,
+            "warning",
+          );
           continue;
         }
 
         const prTitle = prTitles[target] || commitMessage;
         createPullRequest(currentBranch, target, prTitle);
       }
-      
-      console.log('');
-      console.log('╔════════════════════════════════════════════════╗');
-      console.log('║              MERGE INSTRUCTIONS                 ║');
-      console.log('╚════════════════════════════════════════════════╝');
-      
+
+      console.log("");
+      console.log("╔════════════════════════════════════════════════╗");
+      console.log("║              MERGE INSTRUCTIONS                 ║");
+      console.log("╚════════════════════════════════════════════════╝");
+
       // Check for protected branches
-      const protectedBranches = ['main', 'master', 'uat', 'staging'];
-      const hasProtected = targetBranches.some(b => protectedBranches.includes(b));
-      const nonProtected = targetBranches.filter(b => !protectedBranches.includes(b));
-      
+      const protectedBranches = ["main", "master", "uat", "staging"];
+      const hasProtected = targetBranches.some((b) =>
+        protectedBranches.includes(b),
+      );
+      const nonProtected = targetBranches.filter(
+        (b) => !protectedBranches.includes(b),
+      );
+
       if (hasProtected) {
-        console.log('\n📢 Protected Branches (main, uat, staging, master):');
-        console.log('   ✋ Cannot merge locally - use GitHub/GitLab UI');
+        console.log("\n📢 Protected Branches (main, uat, staging, master):");
+        console.log("   ✋ Cannot merge locally - use GitHub/GitLab UI");
         targetBranches
-          .filter(b => protectedBranches.includes(b))
-          .forEach(branch => {
+          .filter((b) => protectedBranches.includes(b))
+          .forEach((branch) => {
             console.log(`   📍 PR created for → ${branch}`);
           });
       }
-      
+
       if (nonProtected.length > 0) {
-        console.log('\n🔓 Non-Protected Branches:');
-        console.log('   ✅ Can merge locally or via UI');
-        nonProtected.forEach(branch => {
+        console.log("\n🔓 Non-Protected Branches:");
+        console.log("   ✅ Can merge locally or via UI");
+        nonProtected.forEach((branch) => {
           console.log(`   📍 PR created for → ${branch}`);
         });
-        
+
         if (autoMerge) {
-          console.log('\n   Merging locally...');
+          console.log("\n   Merging locally...");
           for (const branch of nonProtected) {
             mergeBranch(currentBranch, branch);
           }
         }
       }
-      
-      console.log('\n💡 Next steps:');
-      console.log('   1. Review PR on GitHub/GitLab');
-      console.log('   2. Request/wait for approvals');
-      console.log('   3. Merge via UI when ready\n');
+
+      console.log("\n💡 Next steps:");
+      console.log("   1. Review PR on GitHub/GitLab");
+      console.log("   2. Request/wait for approvals");
+      console.log("   3. Merge via UI when ready\n");
+    } else {
+      console.log("");
+      log("Skipped PR creation (commit & push only)", "info");
+      console.log(
+        `   Open a PR later with: git smartc ${CONFIG.defaultTargets.join(",")}`,
+      );
     }
 
-    console.log('');
-    console.log('╔════════════════════════════════════════════════╗');
-    console.log('║            ✨ WORKFLOW COMPLETE ✨              ║');
-    console.log('╚════════════════════════════════════════════════╝');
-    console.log('');
+    console.log("");
+    console.log("╔════════════════════════════════════════════════╗");
+    console.log("║            ✨ WORKFLOW COMPLETE ✨              ║");
+    console.log("╚════════════════════════════════════════════════╝");
+    console.log("");
   } catch (err) {
-    console.error('');
+    console.error("");
     error(`Workflow failed: ${err.message}`);
   }
 }

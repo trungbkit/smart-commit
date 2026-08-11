@@ -96,7 +96,7 @@ git smartc [targets] [flags]
 
 | Flag | Description |
 |---|---|
-| `--no-pr` | Commit and push only; skip PR creation entirely |
+| `--no-pr`, `--push-only`, `-po`, `-p` | Commit and push only; skip PR creation entirely (no target branches are fetched or analyzed) |
 | `--no-stage`, `-ns` | Don't run `git add .` — commit only what you already staged |
 | `--merge-local` | After creating PRs, merge locally into any **non-protected** target branches |
 | `-y`, `--yes` | Skip the confirmation prompt |
@@ -114,7 +114,7 @@ git smartc staging
 git smartc main,staging
 
 # Commit + push, no PRs
-git smartc --no-pr
+git smartc --push-only     # or --no-pr / -po / -p
 
 # Commit only pre-staged files
 git add src/auth.js
@@ -162,7 +162,7 @@ Proceed? (y/n): y
 
 ### Protected branches
 
-`main`, `master`, `uat`, and `staging` are treated as protected — the script opens a PR and tells you to merge via the GitHub UI. `--merge-local` only affects targets outside that list; for those it checks out the branch, pulls, merges, pushes, and returns you to your original branch. Because local merging happens in the PR stage, `--merge-local` has no effect when combined with `--no-pr`.
+`main`, `master`, `uat`, and `staging` are treated as protected — the script opens a PR and tells you to merge via the GitHub UI. `--merge-local` only affects targets outside that list; for those it checks out the branch, pulls, merges, pushes, and returns you to your original branch. Because local merging happens in the PR stage, `--merge-local` has no effect when combined with `--no-pr` / `--push-only` (the script warns if you pass both).
 
 ## 📋 Commit Message Format
 
