@@ -27,6 +27,8 @@
  *   git-smart-commit --no-stage         # Skip auto-staging
  *   git-smart-commit develop --merge-local  # Merge develop locally
  *   git-smart-commit main -y            # Skip the confirmation prompt
+ *   git-smart-commit -ns uat -y         # Flags may come before the targets
+ *   git-smart-commit --help             # Full flag reference
  */
 
 const { execSync, spawnSync } = require("child_process");
@@ -897,53 +899,125 @@ async function showPreview(
 }
 
 // ============================================================================
+// ARGUMENT PARSING
+// ============================================================================
+
+const USAGE = `Usage: git smartc [targets] [flags]
+
+  targets              Comma-separated branch list (default: ${CONFIG.defaultTargets.join(
+    ",",
+  )})
+
+  --no-pr              Commit & push only, skip PR creation
+  --push-only, -po, -p Same as --no-pr
+  --no-stage, -ns      Skip auto-staging (commit only what's already staged)
+  --merge-local        Merge the target locally after the PR (non-protected only)
+  -y, --yes            Skip the confirmation prompt
+  -h, --help           Show this help
+
+Examples:
+  git smartc                     PR to ${CONFIG.defaultTargets.join(" & ")}
+  git smartc staging             PR to staging only
+  git smartc main,staging        PR to main & staging
+  git smartc -ns uat -y          PR to uat only, no auto-stage, no prompt`;
+
+// Every flag the CLI accepts. Anything else dash-prefixed is a typo and is
+// reported rather than silently ignored.
+const KNOWN_FLAGS = new Set([
+  "--no-pr",
+  "--push-only",
+  "-po",
+  "-p",
+  "--no-stage",
+  "-ns",
+  "--merge-local",
+  "-y",
+  "--yes",
+  "-h",
+  "--help",
+]);
+
+// Split argv into flags and positionals in a single pass. Flags may appear
+// anywhere, so the target list is "the first non-flag argument" rather than
+// "argv[0]" — the latter silently dropped `uat` in `git smartc -ns uat -y` and
+// fell back to the defaults, opening PRs the caller never asked for.
+function parseArgs(argv) {
+  const flags = [];
+  const positionals = [];
+  const unknown = [];
+
+  for (const arg of argv) {
+    if (arg.startsWith("-")) {
+      flags.push(arg);
+      if (!KNOWN_FLAGS.has(arg)) unknown.push(arg);
+    } else {
+      positionals.push(arg);
+    }
+  }
+
+  if (flags.includes("-h") || flags.includes("--help")) {
+    console.log(USAGE);
+    process.exit(0);
+  }
+
+  // Fail loudly on typos: a mistyped flag used to be a no-op, so `--no-stag`
+  // would quietly stage everything.
+  if (unknown.length > 0) {
+    error(
+      `Unknown flag${unknown.length > 1 ? "s" : ""}: ${unknown.join(", ")}\n\n${USAGE}`,
+    );
+  }
+
+  // Targets are comma-separated, so more than one positional is a mistake
+  // (usually a space where a comma belonged) rather than a list.
+  if (positionals.length > 1) {
+    error(
+      `Expected at most one target list, got ${positionals.length}: ${positionals.join(" ")}\n` +
+        `   Separate targets with commas, not spaces — did you mean "${positionals.join(",")}"?\n\n${USAGE}`,
+    );
+  }
+
+  let targetBranches = CONFIG.defaultTargets;
+  if (positionals.length === 1) {
+    // Trim so `"uat, main"` works, and drop empty segments from stray commas.
+    targetBranches = positionals[0]
+      .split(",")
+      .map((name) => name.trim())
+      .filter(Boolean);
+
+    if (targetBranches.length === 0) {
+      error(`No branch names in target list: "${positionals[0]}"\n\n${USAGE}`);
+    }
+  }
+
+  const has = (...names) => names.some((name) => flags.includes(name));
+
+  return {
+    targetBranches,
+    // Commit & push only — no PR. --push-only (and its short forms) are
+    // aliases for --no-pr, named for what the run actually does.
+    createPRs: !has("--no-pr", "--push-only", "-po", "-p"),
+    autoStage: !has("--no-stage", "-ns"),
+    // Merge locally after the PR (only meaningful for non-protected targets).
+    autoMerge: has("--merge-local"),
+    skipConfirm: has("-y", "--yes"),
+  };
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
 async function main() {
   try {
     // Parse arguments
-    const args = process.argv.slice(2);
-    let targetBranches = CONFIG.defaultTargets;
-    let createPRs = true;
-    let autoStage = true; // Whether to auto-stage files
-    let autoMerge = false; // Whether to merge locally after PR (only for non-protected)
-
-    if (args.length > 0) {
-      const first = args[0];
-      // Any dash-prefixed leading arg is a flag, not a target list — short
-      // flags included (-y, -ns, -p), which would otherwise be read as a
-      // branch name.
-      if (!first.startsWith("-")) {
-        targetBranches = first.split(",");
-      }
-    }
-
-    // Commit & push only — no PR. --push-only (and its short forms) are
-    // aliases for --no-pr, named for what the run actually does.
-    if (
-      args.includes("--no-pr") ||
-      args.includes("--push-only") ||
-      args.includes("-po") ||
-      args.includes("-p")
-    ) {
-      createPRs = false;
-    }
-
-    if (args.includes("--no-stage") || args.includes("-ns")) {
-      autoStage = false;
-    }
-
-    if (args.includes("--merge-local")) {
-      autoMerge = true;
-    }
+    const { targetBranches, createPRs, autoStage, autoMerge, skipConfirm } =
+      parseArgs(process.argv.slice(2));
 
     // Local merging happens in the PR stage, so it can't run in push-only mode.
     if (autoMerge && !createPRs) {
       log("--merge-local has no effect without PR creation", "warning");
     }
-
-    const skipConfirm = args.includes("-y") || args.includes("--yes");
 
     // Welcome
     console.log("");

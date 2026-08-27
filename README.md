@@ -90,7 +90,7 @@ git smartc [targets] [flags]
 
 | Argument | Description |
 |---|---|
-| `targets` | Comma-separated target branches for PRs, e.g. `staging,main`. Must be the **first** argument. Defaults to `uat,main`. |
+| `targets` | Comma-separated target branches for PRs, e.g. `staging,main`. May appear anywhere among the flags. Defaults to `uat,main`. |
 
 ### Flags
 
@@ -100,6 +100,7 @@ git smartc [targets] [flags]
 | `--no-stage`, `-ns` | Don't run `git add .` — commit only what you already staged |
 | `--merge-local` | After creating PRs, merge locally into any **non-protected** target branches |
 | `-y`, `--yes` | Skip the confirmation prompt |
+| `-h`, `--help` | Print the flag reference and exit |
 
 ### Examples
 
@@ -125,7 +126,13 @@ git smartc develop --merge-local
 
 # Unattended
 git smartc main -y
+
+# Flags and targets can be interleaved
+git smartc -ns uat -y
 ```
+
+Unknown flags and space-separated targets (`git smartc uat main`) are rejected
+with an error rather than silently ignored.
 
 ## 🔄 What It Actually Does
 
