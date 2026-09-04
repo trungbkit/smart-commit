@@ -33,6 +33,7 @@
 
 const { execSync, spawnSync } = require("child_process");
 const https = require("https");
+const crypto = require("crypto");
 
 // ============================================================================
 // CONFIG
@@ -226,17 +227,25 @@ function getGitDiff() {
       return "";
     }
 
-    // Limit diff size to avoid token limits (max 5000 lines)
-    const lines = diff.split("\n");
-    if (lines.length > 5000) {
+    // Condense rather than blindly slicing the first N lines: generated files
+    // are dropped and every remaining file is capped, so the model still sees
+    // the code that explains the change even in a very large diff.
+    const total = diff.split("\n").length;
+    const condensed = condenseDiff(diff, {
+      maxLines: 5000,
+      maxLinesPerFile: 500,
+    });
+    if (condensed.generated.length) {
       log(
-        `Large diff (${lines.length} lines). Truncating to 5000 lines for analysis.`,
-        "warning",
+        `Ignoring generated files in analysis: ${condensed.generated.join(", ")}`,
+        "info",
       );
-      diff = lines.slice(0, 5000).join("\n");
+    }
+    if (condensed.diff.split("\n").length < total) {
+      log(`Large diff (${total} lines). Condensed for analysis.`, "warning");
     }
 
-    return diff;
+    return condensed.diff;
   } catch (err) {
     error(`Failed to get git diff: ${err.message}`);
   }
@@ -277,6 +286,106 @@ function remoteBranchExists(branch, remote = "origin") {
   }
 }
 
+// Files whose diffs are machine-generated: they are huge, they dominate the
+// token budget, and they say nothing about the intent of a change. Dropping
+// them is what stops PR titles like "chore: update package-lock.json".
+const GENERATED_FILE_PATTERNS = [
+  /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|composer\.lock|Gemfile\.lock|Cargo\.lock|poetry\.lock|go\.sum|Podfile\.lock)$/i,
+  /(^|\/)(dist|build|out|vendor|node_modules|coverage|__snapshots__|\.next|\.nuxt)\//,
+  /\.(min\.js|min\.css|map|snap|lock)$/i,
+  /(^|\/)\.pnp\.[cm]?js$/,
+];
+
+function isGeneratedFile(path) {
+  return GENERATED_FILE_PATTERNS.some((re) => re.test(path));
+}
+
+// Split a unified diff into one entry per file so it can be filtered and
+// budgeted per file rather than as one opaque blob.
+function splitDiffByFile(diff) {
+  if (!diff) return [];
+  return diff
+    .split(/^(?=diff --git )/m)
+    .filter((chunk) => chunk.trim())
+    .map((chunk) => {
+      const header = chunk.match(/^diff --git a\/(.+?) b\/(.+)$/m);
+      return { path: header ? header[2] : "(unknown)", text: chunk };
+    });
+}
+
+// Trim a diff down to something an LLM can read while still being
+// representative. The old behaviour — slice the first N lines — biased hard
+// toward whatever sorts first alphabetically, so a branch with a lockfile or
+// an `assets/` folder could spend its entire budget before reaching the code
+// that actually explains the change. Instead: drop generated files, cap each
+// remaining file, then apply the overall budget.
+function condenseDiff(diff, { maxLines = 6000, maxLinesPerFile = 400 } = {}) {
+  const empty = { diff: "", generated: [], omitted: [] };
+  if (!diff) return empty;
+
+  const files = splitDiffByFile(diff);
+  if (!files.length) {
+    const lines = diff.split("\n");
+    return {
+      ...empty,
+      diff:
+        lines.length > maxLines ? lines.slice(0, maxLines).join("\n") : diff,
+    };
+  }
+
+  const generated = [];
+  const interesting = files.filter((file) => {
+    if (!isGeneratedFile(file.path)) return true;
+    generated.push(file.path);
+    return false;
+  });
+
+  // A change that is *only* generated files still needs a title, so fall back
+  // to showing them rather than handing the model an empty diff. They are no
+  // longer "excluded", so stop reporting them as such.
+  const source = interesting.length ? interesting : files;
+  if (!interesting.length) generated.length = 0;
+
+  // Per-file caps exist only to share a scarce budget. If everything already
+  // fits, hand over the diff whole rather than truncating files for no reason.
+  const totalLines = source.reduce(
+    (sum, file) => sum + file.text.split("\n").length,
+    0,
+  );
+  if (totalLines <= maxLines) {
+    return {
+      diff: source.map((file) => file.text).join(""),
+      generated,
+      omitted: [],
+    };
+  }
+
+  const omitted = [];
+  const chunks = [];
+  let budget = maxLines;
+
+  for (const file of source) {
+    if (budget <= 0) {
+      omitted.push(file.path);
+      continue;
+    }
+    const lines = file.text.split("\n");
+    const cap = Math.min(maxLinesPerFile, budget);
+    if (lines.length > cap) {
+      chunks.push(
+        lines.slice(0, cap).join("\n") +
+          `\n… (${lines.length - cap} more changed lines in ${file.path})\n`,
+      );
+      budget -= cap;
+    } else {
+      chunks.push(file.text);
+      budget -= lines.length;
+    }
+  }
+
+  return { diff: chunks.join(""), generated, omitted };
+}
+
 // Diff a local branch against the remote target. The remote target must be
 // fresh: main() calls fetchRemote() before this, so origin/<toBranch> reflects
 // the latest state on the server rather than a stale local tracking ref.
@@ -304,25 +413,6 @@ function getDiffBetweenBranches(fromBranch, toBranch, remote = "origin") {
       diff = run("git", ["diff", remoteRef, fromBranch]);
     }
 
-    if (!diff) {
-      log(
-        `No changes found between ${remoteRef} and ${fromBranch}. ` +
-          `Branch may already be merged or no commits ahead.`,
-        "warning",
-      );
-      return "";
-    }
-
-    // Limit diff size to avoid token limits (max 8000 lines)
-    const lines = diff.split("\n");
-    if (lines.length > 8000) {
-      log(
-        `Large diff (${lines.length} lines). Truncating to 8000 lines for analysis.`,
-        "warning",
-      );
-      diff = lines.slice(0, 8000).join("\n");
-    }
-
     return diff;
   } catch (err) {
     log(
@@ -331,6 +421,100 @@ function getDiffBetweenBranches(fromBranch, toBranch, remote = "origin") {
     );
     return "";
   }
+}
+
+// Subjects of the commits this branch adds on top of the remote target. These
+// are the highest-signal input for a PR title: they are the author's own words
+// about each step, so the model summarises intent instead of guessing it from
+// diff hunks.
+function getBranchCommitSubjects(
+  fromBranch,
+  toBranch,
+  remote = "origin",
+  max = 30,
+) {
+  if (!remoteBranchExists(toBranch, remote)) return [];
+  try {
+    const out = run("git", [
+      "log",
+      "--no-merges",
+      `--max-count=${max}`,
+      "--format=%s",
+      `${remote}/${toBranch}..${fromBranch}`,
+    ]);
+    return out ? out.split("\n").filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+// `--stat` summary of the branch diff. Always included in the prompt, even
+// when the diff body is truncated, so the model can see the shape of the whole
+// change (which areas, how many files) rather than only the part that fit.
+function getBranchDiffStat(fromBranch, toBranch, remote = "origin") {
+  if (!remoteBranchExists(toBranch, remote)) return "";
+  try {
+    return run("git", [
+      "diff",
+      "--stat",
+      "--stat-width=100",
+      `${remote}/${toBranch}...${fromBranch}`,
+    ]);
+  } catch {
+    return "";
+  }
+}
+
+// Files that are new and unstaged. `git diff` cannot show them, so without
+// this a branch whose whole point is a set of new files looks empty to the
+// model. Names alone are enough context for a title.
+function getUntrackedFiles(max = 40) {
+  try {
+    const out = run("git", ["ls-files", "--others", "--exclude-standard"]);
+    if (!out) return [];
+    return out
+      .split("\n")
+      .filter(Boolean)
+      .filter((path) => !isGeneratedFile(path))
+      .slice(0, max);
+  } catch {
+    return [];
+  }
+}
+
+// Everything the PR title generator needs for one target branch, gathered in
+// one place. `pendingDiff` matters because titles are generated *before* the
+// commit is created: without it, the title describes only the work that was
+// already committed and misses the change the user is running the tool for.
+function collectPRContext(
+  fromBranch,
+  toBranch,
+  {
+    pendingDiff = "",
+    commitMessage = null,
+    includeUntracked = false,
+    remote = "origin",
+  } = {},
+) {
+  const branchDiff = condenseDiff(
+    getDiffBetweenBranches(fromBranch, toBranch, remote),
+  );
+  const pending = condenseDiff(pendingDiff, {
+    maxLines: 2000,
+    maxLinesPerFile: 300,
+  });
+
+  return {
+    fromBranch,
+    toBranch,
+    commitMessage,
+    commits: getBranchCommitSubjects(fromBranch, toBranch, remote),
+    stat: getBranchDiffStat(fromBranch, toBranch, remote),
+    diff: branchDiff.diff,
+    pendingDiff: pending.diff,
+    untracked: includeUntracked ? getUntrackedFiles() : [],
+    generated: [...new Set([...branchDiff.generated, ...pending.generated])],
+  };
 }
 
 // ============================================================================
@@ -567,19 +751,27 @@ Example format: feat(auth): add login validation
   }
 }
 
-// Build a human-readable PR title without the AI, used when there is no
-// branch diff to analyze or when the API call fails. Prefers the commit
-// message summary, then a humanized source branch name.
-function buildHumanPRTitle(targetBranch, commitMessage, currentBranch) {
-  if (commitMessage) {
-    // Drop the conventional-commit prefix (e.g. "feat(auth): ") for readability.
-    const summary = commitMessage
-      .replace(/^[a-z]+(\([^)]*\))?!?:\s*/i, "")
-      .trim();
-    if (summary) {
-      const sentence = summary.charAt(0).toUpperCase() + summary.slice(1);
-      return `${sentence} (→ ${targetBranch})`;
+const PR_TITLE_MAX_LENGTH = 72;
+
+// Build a human-readable PR title without the AI, used when there is nothing
+// to analyze or when the API call fails. Prefers the commit message summary,
+// then the branch's own commit subjects, then a humanized branch name.
+function buildHumanPRTitle(
+  targetBranch,
+  commitMessage,
+  currentBranch,
+  commits = [],
+) {
+  const fromCommit = commitMessage || commits[0];
+  if (fromCommit) {
+    // Keep the conventional-commit prefix if there is one — it is meaningful
+    // in a PR title too — and only tidy up the description that follows.
+    const match = fromCommit.match(/^([a-z]+(?:\([^)]*\))?!?):\s*(.+)$/i);
+    if (match && match[2].trim()) {
+      return `${match[1].toLowerCase()}: ${match[2].trim()}`.slice(0, 120);
     }
+    const summary = fromCommit.trim();
+    if (summary) return summary.charAt(0).toUpperCase() + summary.slice(1);
   }
 
   if (currentBranch) {
@@ -589,53 +781,196 @@ function buildHumanPRTitle(targetBranch, commitMessage, currentBranch) {
       .replace(/[-_/]+/g, " ")
       .trim();
     if (readable) {
-      const sentence = readable.charAt(0).toUpperCase() + readable.slice(1);
-      return `${sentence} (→ ${targetBranch})`;
+      return readable.charAt(0).toUpperCase() + readable.slice(1);
     }
   }
 
   return `Merge changes into ${targetBranch}`;
 }
 
-async function generatePRTitle(
-  diff,
-  targetBranch,
-  { commitMessage, currentBranch } = {},
-) {
+// Models routinely wrap the answer in fences, quotes, a "Sure, here's..."
+// preamble, or a reasoning block, and the old code passed all of that straight
+// into `gh pr create --title`. Reduce whatever came back to a single clean
+// title, or return null so the caller can fall back.
+function sanitizeTitle(raw, { maxLength = PR_TITLE_MAX_LENGTH } = {}) {
+  if (!raw) return null;
+
+  const text = String(raw)
+    .replace(/<think>[\s\S]*?<\/think>/gi, "") // reasoning-model scratchpad
+    .replace(/```[a-z]*/gi, "")
+    .replace(/\r/g, "");
+
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (!lines.length) return null;
+
+  // Skip a conversational preamble ("Here's the title:") if a real title
+  // follows it; otherwise fall back to the first line we have.
+  const isPreamble = (line) =>
+    /^(sure|okay|ok|here('s| is)|certainly|based on)\b/i.test(line) ||
+    /^(pr\s+)?title\s*:?$/i.test(line);
+  let title = lines.find((line) => !isPreamble(line)) || lines[0];
+
+  title = title
+    .replace(/^(?:pr\s+)?title\s*[:\-—]\s*/i, "")
+    .replace(/^[-*+]\s+/, "") // list bullet
+    .replace(/^#+\s*/, "") // markdown heading
+    .replace(/^["'`“‘]+|["'`”’]+$/g, "") // wrapping quotes
+    .replace(/\s+/g, " ")
+    .replace(/[.\s]+$/, "") // trailing period
+    .trim();
+
+  // Reject anything that clearly is not a title: refusals, empty output, or a
+  // fragment too short to mean anything.
+  if (title.length < 5) return null;
+  if (!/[a-z]/i.test(title)) return null;
+  if (
+    /^(i (can|cannot|can't|'m|am)\b|as an ai\b|sorry\b|unable to\b)/i.test(
+      title,
+    )
+  ) {
+    return null;
+  }
+
+  // Normalize the conventional-commit prefix: "Feat(Auth): ..." → "feat(auth): ..."
+  title = title.replace(
+    /^([A-Za-z]+)(\(([^)]*)\))?(!?):\s*/,
+    (full, type, _paren, scope, bang) => {
+      const known =
+        /^(feat|fix|refactor|chore|docs|test|style|perf|ci|build|revert)$/i;
+      if (!known.test(type)) return full;
+      const scopePart = scope ? `(${scope.toLowerCase()})` : "";
+      return `${type.toLowerCase()}${scopePart}${bang}: `;
+    },
+  );
+
+  if (title.length > maxLength) {
+    const cut = title.slice(0, maxLength);
+    const lastSpace = cut.lastIndexOf(" ");
+    title = (lastSpace > maxLength * 0.6 ? cut.slice(0, lastSpace) : cut)
+      .replace(/[\s,;:\-–—]+$/, "")
+      .trim();
+  }
+
+  return title || null;
+}
+
+// Render one labelled section, or nothing when there is no content for it.
+function promptSection(heading, body) {
+  return body && String(body).trim() ? `\n## ${heading}\n${body}\n` : "";
+}
+
+function buildPRTitlePrompt(context) {
+  const {
+    fromBranch,
+    commitMessage,
+    commits = [],
+    stat,
+    diff,
+    pendingDiff,
+    untracked = [],
+    generated = [],
+  } = context;
+
+  return `You are a senior engineer writing the title of a pull request. Read every section below, then output one title.
+
+${promptSection("Source branch", `\`${fromBranch}\``)}${promptSection(
+    "Commits already on this branch (newest first)",
+    commits.length ? commits.map((s) => `- ${s}`).join("\n") : "",
+  )}${promptSection(
+    "Commit about to be added",
+    commitMessage ? `- ${commitMessage}` : "",
+  )}${promptSection("Files changed", stat ? `\`\`\`\n${stat}\n\`\`\`` : "")}${promptSection(
+    "New files not yet tracked by git",
+    untracked.length ? untracked.map((f) => `- ${f}`).join("\n") : "",
+  )}${promptSection(
+    "Committed changes",
+    diff ? `\`\`\`diff\n${diff}\n\`\`\`` : "",
+  )}${promptSection(
+    "Uncommitted changes that this PR will also include",
+    pendingDiff ? `\`\`\`diff\n${pendingDiff}\n\`\`\`` : "",
+  )}${promptSection(
+    "Excluded from the diff above (generated files, ignore them)",
+    generated.length ? generated.map((f) => `- ${f}`).join("\n") : "",
+  )}
+## How to choose the title
+1. Identify the single most important user- or developer-visible outcome of the whole branch. That is the title. Supporting refactors, test updates, and formatting are not the title.
+2. Format: \`type(scope): description\` — types: feat, fix, refactor, chore, docs, test, style, perf, ci, build.
+3. Pick the type from that main outcome, not from whichever file changed the most lines. New capability → feat. Corrected behaviour → fix. Same behaviour, better structure → refactor.
+4. Scope is the feature area, module, or package touched (e.g. auth, api, cli, checkout), lowercase. Omit the scope entirely if the branch spans several unrelated areas.
+5. Description: imperative mood ("add", not "added"/"adds"), specific, and about behaviour or intent — never about file names, line counts, or the fact that files were "updated".
+6. Under ${PR_TITLE_MAX_LENGTH} characters total. No trailing period.
+7. Banned as vague: "update code", "various changes", "improvements", "misc fixes", "changes to files", "refactor code". If you are tempted by one of these, name the concrete thing that changed instead.
+8. If the branch genuinely does two things, name the dominant one; use "and" at most once.
+9. Do not mention the target branch, the word "PR", or the branch name itself.
+
+Output only the title, on one line, with no quotes, no code fences, and no explanation.
+
+Good: feat(auth): add SSO login with session refresh
+Good: fix(checkout): prevent double-charge on retried payments
+Bad: chore: update files
+Bad: feat: various improvements and refactoring`;
+}
+
+// Identity of a PR-title prompt. Two target branches that produce the same
+// context get the same key and therefore share a single AI call.
+function contextCacheKey(context) {
+  return crypto
+    .createHash("sha1")
+    .update(
+      [
+        context.commitMessage || "",
+        context.commits.join("\n"),
+        context.stat,
+        context.diff,
+        context.pendingDiff,
+        context.untracked.join("\n"),
+      ].join("\u0000"),
+    )
+    .digest("hex");
+}
+
+async function generatePRTitle(context, targetBranch, options = {}) {
+  const commitMessage = options.commitMessage ?? context.commitMessage;
+  const currentBranch = options.currentBranch ?? context.fromBranch;
   const humanFallback = buildHumanPRTitle(
     targetBranch,
     commitMessage,
     currentBranch,
+    context.commits,
   );
 
-  if (!diff) {
+  // Nothing at all to summarize: no branch commits, no diff, no pending work.
+  const hasMaterial =
+    Boolean(context.diff) ||
+    Boolean(context.pendingDiff) ||
+    context.commits.length > 0 ||
+    context.untracked.length > 0;
+
+  if (!hasMaterial) {
+    log(
+      `No changes found between origin/${targetBranch} and ${currentBranch}. ` +
+        `Using "${humanFallback}" as the PR title.`,
+      "warning",
+    );
     return humanFallback;
   }
 
   log(`Generating PR title for ${targetBranch}...`, "loading");
 
-  const prompt = `You are a professional pull request title generator. Analyze the following code changes and generate a concise, meaningful PR title that summarizes all changes.
-
-## Code changes to analyze:
-\`\`\`diff
-${diff}
-\`\`\`
-
-## Requirements:
-1. Follow conventional commits format: type(scope): description (but can be slightly longer than commit messages)
-2. Types: feat, fix, refactor, chore, docs, test, style, perf, ci, build
-3. Keep title under 72 characters
-4. Summarize the overall impact/purpose of all changes
-5. Use imperative mood (e.g., "add" not "added")
-6. Be specific about what changed
-7. Return ONLY the PR title, nothing else
-
-Example format: feat(auth): add login form and validation logic
-`;
-
   try {
-    const title = await callAI(prompt);
-    return title.trim();
+    const raw = await callAI(buildPRTitlePrompt(context));
+    const title = sanitizeTitle(raw);
+    if (!title) {
+      log(
+        `${providerLabel()} returned an unusable PR title. Falling back to "${humanFallback}".`,
+        "warning",
+      );
+      return humanFallback;
+    }
+    return title;
   } catch (err) {
     log(`Failed to generate PR title: ${err.message}`, "warning");
     return humanFallback;
@@ -1057,16 +1392,38 @@ async function main() {
       log("Fetching latest remote state...", "loading");
       fetchRemote("origin");
 
-      // Generate PR titles for each target branch (in parallel)
-      await Promise.all(
-        targetBranches.map(async (target) => {
-          const branchDiff = getDiffBetweenBranches(currentBranch, target);
-          prTitles[target] = await generatePRTitle(branchDiff, target, {
+      // Gather the full picture for each target, then generate titles in
+      // parallel. Targets that resolve to identical context (common when two
+      // release branches are at the same commit) share one AI call instead of
+      // paying for the same answer twice.
+      const contexts = new Map(
+        targetBranches.map((target) => [
+          target,
+          collectPRContext(currentBranch, target, {
+            pendingDiff: diff,
             commitMessage,
-            currentBranch,
-          });
-        }),
+            // Untracked files only reach the PR when this run stages them.
+            includeUntracked: autoStage && hasChanges,
+          }),
+        ]),
       );
+
+      const pending = new Map();
+      for (const target of targetBranches) {
+        const context = contexts.get(target);
+        const key = contextCacheKey(context);
+        if (!pending.has(key)) {
+          pending.set(
+            key,
+            generatePRTitle(context, target, { commitMessage, currentBranch }),
+          );
+        }
+      }
+      for (const target of targetBranches) {
+        prTitles[target] = await pending.get(
+          contextCacheKey(contexts.get(target)),
+        );
+      }
     }
 
     // Show preview
