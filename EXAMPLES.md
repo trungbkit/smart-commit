@@ -42,6 +42,44 @@ git smartc --push-only     # aliases: --no-pr, -po, -p
 # - Use when you just want to push and handle PRs manually
 ```
 
+## Scenario 2.2: Skipping Steps — Push Only, PR Only
+
+The run is a pipeline (`stage → commit → push → pr`) and each step is skipped
+when it has nothing to do, so most of these need no flag at all.
+
+```bash
+# You already committed by hand; just push and open the PR.
+git commit -m "fix(parser): handle null input"
+git smartc uat
+# stage   skipped (working tree clean)
+# commit  skipped (nothing staged)
+# push    origin/bugfix/null-check
+# pr      → uat
+
+# The branch is already pushed — you only want the PR.
+git smartc uat
+# stage   skipped (working tree clean)
+# commit  skipped (nothing staged)
+# push    skipped (origin already up to date)
+# pr      → uat
+```
+
+Use the explicit flags when your intent differs from what the state suggests:
+
+```bash
+# Dirty tree, but leave every local change alone: push + PR only.
+git smartc uat -nc
+
+# Same, spelled as intent rather than as a skipped step.
+git smartc uat --pr-only
+
+# Commit locally now, push later yourself.
+git smartc uat -np
+
+# Not sure what a run will do? Ask first — it changes nothing.
+git smartc uat --dry-run
+```
+
 ## Scenario 2.1: Commit Message vs PR Title (Branch Diff Analysis)
 
 ```bash

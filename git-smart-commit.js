@@ -10,29 +10,39 @@
  * - OpenAI API keys (fallback provider): export OPENAI_API_KEY=sk-...
  * - Gemini API keys (fallback provider): export GEMINI_API_KEY=...
  *
- * WORKFLOW:
- * 1. Generates AI commit message from code changes
- * 2. Stages & commits changes to current branch
- * 3. Pushes to remote
- * 4. Creates PRs to target branches (uat, main, etc.)
- * 5. For protected branches → merge via GitHub UI
- * 6. For non-protected branches → can merge locally (with --merge-local flag)
+ * WORKFLOW
+ * The run is a four-step pipeline and every step is optional:
+ *
+ *   stage  ->  commit  ->  push  ->  pr
+ *
+ * Each step executes only when it has something to do, decided from the actual
+ * repository state rather than from flags. So one command covers the whole
+ * spectrum: uncommitted edits get staged, committed, pushed and opened as a PR;
+ * a branch that is merely unpushed gets pushed and opened; a branch already on
+ * origin just gets its PR. Flags subtract steps, they don't add them.
+ *
+ * Protected target branches (main, uat, staging, master) must be merged through
+ * the GitHub UI; non-protected ones can be merged locally with --merge-local.
  *
  * USAGE:
- *   git-smart-commit                    # PR to uat & main
- *   git-smart-commit staging            # PR to staging only
+ *   git-smart-commit                    # stage, commit, push, PR to uat & main
+ *   git-smart-commit staging            # same, PR to staging only
  *   git-smart-commit main,staging       # PR to main & staging
- *   git-smart-commit --no-pr            # Commit & push, skip PR
- *   git-smart-commit --push-only        # Same as --no-pr (aliases: -p, -po)
- *   git-smart-commit --no-stage         # Skip auto-staging
- *   git-smart-commit develop --merge-local  # Merge develop locally
- *   git-smart-commit main -y            # Skip the confirmation prompt
- *   git-smart-commit -ns uat -y         # Flags may come before the targets
- *   git-smart-commit --help             # Full flag reference
+ *   git-smart-commit uat -ns            # commit the current index only
+ *   git-smart-commit uat -nc            # nothing to commit: push, then PR
+ *   git-smart-commit uat --pr-only      # nothing to push: PR only
+ *   git-smart-commit --no-pr            # stage, commit & push, skip PR
+ *   git-smart-commit develop --merge-local  # merge develop locally after the PR
+ *   git-smart-commit main -y            # skip the confirmation prompt
+ *   git-smart-commit -ns uat -y         # flags may come before the targets
+ *   git-smart-commit --dry-run          # print the plan, change nothing
+ *   git-smart-commit --help             # full flag reference
  */
 
 const { execSync, spawnSync } = require("child_process");
 const https = require("https");
+const http = require("http");
+const tls = require("tls");
 const crypto = require("crypto");
 
 // ============================================================================
@@ -49,6 +59,21 @@ const CONFIG = {
   geminiModel: process.env.GEMINI_MODEL || "gemini-2.0-flash", // Used when only a Gemini key is set
   maxTokens: 500,
   defaultTargets: ["uat", "main"],
+  // API endpoints. Override when routing through a gateway, mirror, or a
+  // corporate egress proxy that terminates TLS on its own hostname.
+  anthropicBaseUrl: process.env.ANTHROPIC_BASE_URL || "https://api.anthropic.com",
+  openaiBaseUrl: process.env.OPENAI_BASE_URL || "https://api.openai.com",
+  geminiBaseUrl:
+    process.env.GEMINI_BASE_URL || "https://generativelanguage.googleapis.com",
+  requestTimeoutMs:
+    Number(process.env.GIT_SMART_COMMIT_TIMEOUT_MS) > 0
+      ? Number(process.env.GIT_SMART_COMMIT_TIMEOUT_MS)
+      : 30000,
+  // Total attempts per request, including the first.
+  maxAttempts:
+    Number(process.env.GIT_SMART_COMMIT_RETRIES) > 0
+      ? Number(process.env.GIT_SMART_COMMIT_RETRIES)
+      : 3,
 };
 
 // True when an Anthropic credential (OAuth token or API key) is available.
@@ -210,20 +235,154 @@ function debugGitStatus() {
   console.log("─".repeat(50) + "\n");
 }
 
-function getGitDiff() {
-  try {
-    // Get staged changes first
-    let diff = exec("git diff --cached", true);
+// ----------------------------------------------------------------------------
+// PIPELINE STATE
+//
+// These probes answer "what does this repository actually need?" for each step
+// of stage -> commit -> push -> pr. resolvePlan() intersects their answers with
+// the caller's flags, so a step with nothing to do is skipped rather than run
+// and failed. That is what lets the same invocation mean "commit everything and
+// open a PR" in a dirty tree and "just open the PR" in a clean one.
+// ----------------------------------------------------------------------------
 
-    // If nothing staged, get all changes
-    if (!diff) {
-      diff = exec("git diff", true);
+// Run a git command purely for its exit status. The `--quiet` diff forms exit 1
+// when a difference exists and 0 when none does; anything higher is a real
+// failure and is thrown rather than reported as "no changes".
+function gitDiffers(args) {
+  const result = spawnSync("git", args, { encoding: "utf-8" });
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0 && result.status !== 1) {
+    throw new Error(
+      (result.stderr || "").trim() || `git ${args.join(" ")} failed`,
+    );
+  }
+  return result.status === 1;
+}
+
+// Tracked files modified but not staged.
+function hasUnstagedChanges() {
+  return gitDiffers(["diff", "--quiet"]);
+}
+
+// Anything sitting in the index, waiting for a commit.
+function hasStagedChanges() {
+  return gitDiffers(["diff", "--cached", "--quiet"]);
+}
+
+// Files git isn't tracking yet. `git add .` picks them up, so they are work the
+// stage step can do even when no tracked file was touched. Deliberately not
+// getUntrackedFiles(), which filters generated files out for AI context.
+function hasUntrackedFiles() {
+  try {
+    return (
+      run("git", ["ls-files", "--others", "--exclude-standard"]).length > 0
+    );
+  } catch (err) {
+    return false;
+  }
+}
+
+// False in a fresh repository with no commits, where HEAD doesn't resolve.
+function hasCommits() {
+  try {
+    run("git", ["rev-parse", "--verify", "--quiet", "HEAD"]);
+    return true;
+  } catch (err) {
+    return false;
+  }
+}
+
+// Commits the local branch has that origin doesn't. A branch with no remote
+// counterpart always needs a push, since the push is what creates it. Assumes
+// fetchRemote() has already run, so origin/<branch> reflects the real remote.
+function hasUnpushedCommits(branch, remote = "origin") {
+  if (!remoteBranchExists(branch, remote)) return true;
+  try {
+    const ahead = run("git", [
+      "rev-list",
+      "--count",
+      `refs/remotes/${remote}/${branch}..HEAD`,
+    ]);
+    return parseInt(ahead, 10) > 0;
+  } catch (err) {
+    // Can't tell — assume a push is needed rather than silently skipping it
+    // and then opening a PR against a stale remote branch.
+    return true;
+  }
+}
+
+// Intersect what the caller permits with what the repository needs, once, so
+// the preview and the executor can never disagree about what this run will do.
+// `reasons` explains every step that won't run, naming the flag responsible so
+// `-ns` with an empty index reads as a decision instead of a silent no-op.
+function resolvePlan(intent, branch) {
+  const unstaged = hasUnstagedChanges();
+  const untracked = hasUntrackedFiles();
+  const stageable = unstaged || untracked;
+  const staged = hasStagedChanges();
+
+  const stage = intent.allowStage && stageable;
+  const committable = stage || staged;
+  const commit = intent.allowCommit && committable;
+  // A commit made by this run is unpushed by definition, so it forces a push
+  // without needing to re-read the remote.
+  const pushable = commit || hasUnpushedCommits(branch);
+  const push = intent.allowPush && pushable;
+
+  // A step is skipped either because a flag turned it off or because there is
+  // nothing for it to do. The flag wins in the message: it's the actionable half.
+  const reason = (offFlag, needed, idle) =>
+    offFlag ? `skipped (${offFlag})` : needed ? null : `skipped (${idle})`;
+
+  return {
+    stage,
+    commit,
+    push,
+    pr: intent.allowPR,
+    // State the preview surfaces so the user can see work being left behind.
+    unstaged,
+    untracked,
+    staged,
+    reasons: {
+      stage: reason(intent.stageOff, stageable, "working tree clean"),
+      commit: reason(intent.commitOff, committable, "nothing staged"),
+      push: reason(intent.pushOff, pushable, "origin already up to date"),
+      pr: intent.prOff ? `skipped (${intent.prOff})` : null,
+    },
+  };
+}
+
+// The diff the commit message should describe. `includeUnstaged` tracks the
+// stage step: when this run will `git add .` the message must cover the whole
+// working tree, and when staging is off it must cover the index and nothing
+// else — otherwise the message describes changes the commit won't contain.
+function getGitDiff({ includeUnstaged = true } = {}) {
+  try {
+    // `git diff HEAD` needs a HEAD to compare against; a fresh repo has none,
+    // and there everything is necessarily staged or untracked anyway.
+    const useWorkingTree = includeUnstaged && hasCommits();
+    let diff = exec(
+      useWorkingTree ? "git diff HEAD" : "git diff --cached",
+      true,
+    );
+
+    // New files appear in no diff, but `git add .` commits them, so name them
+    // explicitly or the message misses the point of the change entirely.
+    if (includeUnstaged) {
+      const untracked = getUntrackedFiles();
+      if (untracked.length > 0) {
+        diff = `${diff}\n${untracked
+          .map((file) => `+++ b/${file} (new file)`)
+          .join("\n")}`.trim();
+      }
     }
 
     if (!diff) {
-      // No uncommitted changes. Don't abort — the caller may still want to
-      // push existing commits and open a PR. Signal "nothing to commit" by
-      // returning an empty string.
+      // No readable changes. Don't abort — the caller may still want to push
+      // existing commits and open a PR. Signal "nothing to commit" with an
+      // empty string.
       return "";
     }
 
@@ -518,188 +677,372 @@ function collectPRContext(
 }
 
 // ============================================================================
-// CLAUDE API
+// HTTP TRANSPORT
 // ============================================================================
 
-function callClaudeAPI(prompt) {
-  return new Promise((resolve, reject) => {
-    const requestBody = JSON.stringify({
-      model: CONFIG.model,
-      max_tokens: CONFIG.maxTokens,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-    });
+// Network errors worth another attempt: DNS hiccups, dropped or refused
+// connections, and unreachable routes while a VPN is still coming up.
+const RETRYABLE_NETWORK_CODES = new Set([
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EPIPE",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ECONNABORTED",
+]);
 
-    // Build headers with appropriate authentication
-    const headers = {
-      "Content-Type": "application/json",
-      "anthropic-version": "2023-06-01",
-      "Content-Length": Buffer.byteLength(requestBody),
-    };
+function joinUrl(baseUrl, path) {
+  return `${baseUrl.replace(/\/+$/, "")}${path.startsWith("/") ? "" : "/"}${path}`;
+}
 
-    // Add authentication header (OAuth or API key)
-    if (CONFIG.oauthToken) {
-      headers["Authorization"] = `Bearer ${CONFIG.oauthToken}`;
-    } else if (CONFIG.apiKey) {
-      headers["x-api-key"] = CONFIG.apiKey;
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Turn a low-level socket failure into something the user can act on. A bare
+// "getaddrinfo ENOTFOUND api.anthropic.com" says nothing about the usual
+// causes: no connectivity, a VPN that is down, or a proxy-only network.
+function describeNetworkError(err, target) {
+  const host = target.hostname;
+  const hints = [];
+
+  if (err.code === "ENOTFOUND" || err.code === "EAI_AGAIN") {
+    hints.push(`Cannot resolve ${host} (${err.code}).`);
+    hints.push("Check your internet connection, VPN, or DNS settings.");
+    if (!proxyForHost(host)) {
+      hints.push(
+        "Behind a corporate proxy? Set HTTPS_PROXY=http://user:pass@proxy:port.",
+      );
     }
+    hints.push(
+      `Using a gateway or mirror? Point ${baseUrlEnvVar(host)} at it.`,
+    );
+  } else if (err.code === "ETIMEDOUT") {
+    hints.push(`Connection to ${host} timed out after ${CONFIG.requestTimeoutMs}ms.`);
+    hints.push(
+      "Set GIT_SMART_COMMIT_TIMEOUT_MS higher if the network is just slow.",
+    );
+  } else if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET") {
+    hints.push(`Connection to ${host} was ${err.code === "ECONNREFUSED" ? "refused" : "reset"}.`);
+    hints.push("A firewall, proxy, or TLS inspector may be blocking it.");
+  } else {
+    return err;
+  }
 
-    const options = {
-      hostname: "api.anthropic.com",
-      path: "/v1/messages",
-      method: "POST",
-      headers: headers,
-    };
+  const wrapped = new Error(hints.join(" "));
+  wrapped.code = err.code;
+  wrapped.cause = err;
+  return wrapped;
+}
 
-    const req = https.request(options, (res) => {
-      let data = "";
+// Name the base-URL override that applies to the host we failed to reach, so
+// the hint points at the right environment variable.
+function baseUrlEnvVar(hostname) {
+  if (hostname.includes("openai")) return "OPENAI_BASE_URL";
+  if (hostname.includes("googleapis")) return "GEMINI_BASE_URL";
+  return "ANTHROPIC_BASE_URL";
+}
 
-      res.on("data", (chunk) => {
-        data += chunk;
-      });
+// Resolve the proxy to use for a host, honouring NO_PROXY exclusions.
+// Returns a URL or null.
+function proxyForHost(hostname) {
+  const host = hostname.toLowerCase();
+  const noProxy = process.env.NO_PROXY || process.env.no_proxy || "";
+  const exclusions = noProxy
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean);
 
-      res.on("end", () => {
-        try {
-          const response = JSON.parse(data);
+  if (exclusions.includes("*")) return null;
+  for (const entry of exclusions) {
+    const bare = entry.replace(/^\./, "").replace(/:\d+$/, "");
+    if (host === bare || host.endsWith(`.${bare}`)) return null;
+  }
 
-          if (res.statusCode !== 200) {
-            reject(new Error(response.error?.message || "API Error"));
-            return;
-          }
+  const raw =
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    process.env.ALL_PROXY ||
+    process.env.all_proxy;
+  if (!raw) return null;
 
-          const content = response.content[0]?.text || "";
-          resolve(content);
-        } catch (e) {
-          reject(e);
-        }
-      });
+  try {
+    return new URL(raw.includes("://") ? raw : `http://${raw}`);
+  } catch {
+    log(`Ignoring unparseable proxy setting: ${raw}`, "warning");
+    return null;
+  }
+}
+
+function proxyAuthHeader(proxy) {
+  if (!proxy.username) return null;
+  const credentials = `${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`;
+  return `Basic ${Buffer.from(credentials).toString("base64")}`;
+}
+
+// Open a raw TCP tunnel to host:port through an HTTP proxy via CONNECT.
+function openProxyTunnel(proxy, host, port) {
+  return new Promise((resolve, reject) => {
+    const auth = proxyAuthHeader(proxy);
+    const req = http.request({
+      host: proxy.hostname,
+      port: Number(proxy.port) || (proxy.protocol === "https:" ? 443 : 80),
+      method: "CONNECT",
+      path: `${host}:${port}`,
+      headers: auth ? { "Proxy-Authorization": auth } : {},
+      timeout: CONFIG.requestTimeoutMs,
     });
 
+    req.on("connect", (res, socket) => {
+      if (res.statusCode !== 200) {
+        socket.destroy();
+        reject(
+          new Error(
+            `Proxy ${proxy.host} refused CONNECT to ${host}:${port} (HTTP ${res.statusCode})`,
+          ),
+        );
+        return;
+      }
+      resolve(socket);
+    });
+
+    req.on("timeout", () => {
+      const err = new Error(`Proxy ${proxy.host} did not respond in time`);
+      err.code = "ETIMEDOUT";
+      req.destroy(err);
+    });
     req.on("error", reject);
-    req.write(requestBody);
     req.end();
   });
 }
 
-function callOpenAIAPI(prompt) {
-  return new Promise((resolve, reject) => {
-    const requestBody = JSON.stringify({
-      model: CONFIG.openaiModel,
-      max_tokens: CONFIG.maxTokens,
-      messages: [
-        {
-          role: "user",
-          content: prompt,
-        },
-      ],
-    });
+// An agent that reaches the target through the configured proxy: CONNECT
+// tunnel plus a TLS handshake for https targets.
+function tunnelingAgent(proxy, isHttps) {
+  const agent = isHttps
+    ? new https.Agent({ keepAlive: false })
+    : new http.Agent({ keepAlive: false });
 
-    const headers = {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${CONFIG.openaiApiKey}`,
-      "Content-Length": Buffer.byteLength(requestBody),
-    };
-
-    const options = {
-      hostname: "api.openai.com",
-      path: "/v1/chat/completions",
-      method: "POST",
-      headers: headers,
-    };
-
-    const req = https.request(options, (res) => {
-      let data = "";
-
-      res.on("data", (chunk) => {
-        data += chunk;
-      });
-
-      res.on("end", () => {
-        try {
-          const response = JSON.parse(data);
-
-          if (res.statusCode !== 200) {
-            reject(new Error(response.error?.message || "API Error"));
-            return;
-          }
-
-          const content = response.choices?.[0]?.message?.content || "";
-          resolve(content);
-        } catch (e) {
-          reject(e);
+  agent.createConnection = (options, callback) => {
+    openProxyTunnel(proxy, options.host, options.port)
+      .then((socket) => {
+        if (!isHttps) {
+          callback(null, socket);
+          return;
         }
-      });
-    });
+        const servername = options.servername || options.host;
+        const tlsSocket = tls.connect({ socket, servername }, () =>
+          callback(null, tlsSocket),
+        );
+        tlsSocket.on("error", callback);
+      })
+      .catch(callback);
+  };
 
-    req.on("error", reject);
-    req.write(requestBody);
-    req.end();
-  });
+  return agent;
 }
 
-function callGeminiAPI(prompt) {
+// Single POST attempt. Resolves the parsed JSON body on 2xx; rejects with an
+// Error carrying `.statusCode` on an API error and `.code` on a socket error.
+function postJSONOnce(url, headers, body) {
   return new Promise((resolve, reject) => {
-    const requestBody = JSON.stringify({
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: prompt }],
-        },
-      ],
-      generationConfig: {
-        maxOutputTokens: CONFIG.maxTokens,
+    const target = new URL(url);
+    const isHttps = target.protocol !== "http:";
+    const port = target.port ? Number(target.port) : isHttps ? 443 : 80;
+    const proxy = proxyForHost(target.hostname);
+    const transport = isHttps ? https : http;
+
+    const req = transport.request(
+      {
+        hostname: target.hostname,
+        port,
+        path: `${target.pathname}${target.search}`,
+        method: "POST",
+        headers,
+        timeout: CONFIG.requestTimeoutMs,
+        agent: proxy ? tunnelingAgent(proxy, isHttps) : undefined,
       },
-    });
+      (res) => {
+        let data = "";
+        res.setEncoding("utf-8");
+        res.on("data", (chunk) => {
+          data += chunk;
+        });
+        res.on("end", () => {
+          let parsed = null;
+          try {
+            parsed = JSON.parse(data);
+          } catch {
+            // Fall through: a non-JSON body means a proxy or gateway answered.
+          }
 
-    const headers = {
-      "Content-Type": "application/json",
-      // Key goes in a header, not the query string, so it never lands in logs.
-      "x-goog-api-key": CONFIG.geminiApiKey,
-      "Content-Length": Buffer.byteLength(requestBody),
-    };
-
-    const options = {
-      hostname: "generativelanguage.googleapis.com",
-      // encodeURIComponent so a user-supplied GEMINI_MODEL can't alter the path.
-      path: `/v1beta/models/${encodeURIComponent(CONFIG.geminiModel)}:generateContent`,
-      method: "POST",
-      headers: headers,
-    };
-
-    const req = https.request(options, (res) => {
-      let data = "";
-
-      res.on("data", (chunk) => {
-        data += chunk;
-      });
-
-      res.on("end", () => {
-        try {
-          const response = JSON.parse(data);
-
-          if (res.statusCode !== 200) {
-            reject(new Error(response.error?.message || "API Error"));
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            if (!parsed) {
+              reject(
+                new Error(
+                  `Unexpected non-JSON response from ${target.hostname}`,
+                ),
+              );
+              return;
+            }
+            resolve(parsed);
             return;
           }
 
-          // Gemini splits generated text across parts; join them back together.
-          const parts = response.candidates?.[0]?.content?.parts || [];
-          const content = parts.map((p) => p.text || "").join("");
-          resolve(content);
-        } catch (e) {
-          reject(e);
-        }
-      });
-    });
+          const err = new Error(
+            parsed?.error?.message ||
+              parsed?.message ||
+              `API Error (HTTP ${res.statusCode})`,
+          );
+          err.statusCode = res.statusCode;
+          err.retryAfter = Number(res.headers["retry-after"]) || 0;
+          reject(err);
+        });
+      },
+    );
 
-    req.on("error", reject);
-    req.write(requestBody);
+    req.on("timeout", () => {
+      const err = new Error(`Request to ${target.hostname} timed out`);
+      err.code = "ETIMEDOUT";
+      req.destroy(err);
+    });
+    req.on("error", (err) => reject(describeNetworkError(err, target)));
+    req.write(body);
     req.end();
   });
+}
+
+function isRetryable(err) {
+  if (err.code && RETRYABLE_NETWORK_CODES.has(err.code)) return true;
+  const status = err.statusCode;
+  return status === 408 || status === 429 || (status >= 500 && status < 600);
+}
+
+// POST with retries on transient failures, so a momentary DNS or connection
+// blip does not abort the commit.
+async function postJSON(url, headers, body) {
+  let lastError;
+
+  for (let attempt = 1; attempt <= CONFIG.maxAttempts; attempt++) {
+    try {
+      return await postJSONOnce(url, headers, body);
+    } catch (err) {
+      lastError = err;
+      if (attempt === CONFIG.maxAttempts || !isRetryable(err)) break;
+
+      const backoffMs = err.retryAfter
+        ? err.retryAfter * 1000
+        : 500 * 2 ** (attempt - 1);
+      log(
+        `${providerLabel()} request failed (${err.code || `HTTP ${err.statusCode}`}), retrying in ${Math.round(backoffMs / 100) / 10}s...`,
+        "warning",
+      );
+      await sleep(backoffMs);
+    }
+  }
+
+  throw lastError;
+}
+
+// ============================================================================
+// PROVIDER APIS
+// ============================================================================
+
+async function callClaudeAPI(prompt) {
+  const body = JSON.stringify({
+    model: CONFIG.model,
+    max_tokens: CONFIG.maxTokens,
+    messages: [
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
+  });
+
+  const headers = {
+    "Content-Type": "application/json",
+    "anthropic-version": "2023-06-01",
+    "Content-Length": Buffer.byteLength(body),
+  };
+
+  // Add authentication header (OAuth or API key)
+  if (CONFIG.oauthToken) {
+    headers["Authorization"] = `Bearer ${CONFIG.oauthToken}`;
+  } else if (CONFIG.apiKey) {
+    headers["x-api-key"] = CONFIG.apiKey;
+  }
+
+  const response = await postJSON(
+    joinUrl(CONFIG.anthropicBaseUrl, "/v1/messages"),
+    headers,
+    body,
+  );
+  return response.content?.[0]?.text || "";
+}
+
+async function callOpenAIAPI(prompt) {
+  const body = JSON.stringify({
+    model: CONFIG.openaiModel,
+    max_tokens: CONFIG.maxTokens,
+    messages: [
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
+  });
+
+  const headers = {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${CONFIG.openaiApiKey}`,
+    "Content-Length": Buffer.byteLength(body),
+  };
+
+  const response = await postJSON(
+    joinUrl(CONFIG.openaiBaseUrl, "/v1/chat/completions"),
+    headers,
+    body,
+  );
+  return response.choices?.[0]?.message?.content || "";
+}
+
+async function callGeminiAPI(prompt) {
+  const body = JSON.stringify({
+    contents: [
+      {
+        role: "user",
+        parts: [{ text: prompt }],
+      },
+    ],
+    generationConfig: {
+      maxOutputTokens: CONFIG.maxTokens,
+    },
+  });
+
+  const headers = {
+    "Content-Type": "application/json",
+    // Key goes in a header, not the query string, so it never lands in logs.
+    "x-goog-api-key": CONFIG.geminiApiKey,
+    "Content-Length": Buffer.byteLength(body),
+  };
+
+  const response = await postJSON(
+    // encodeURIComponent so a user-supplied GEMINI_MODEL can't alter the path.
+    joinUrl(
+      CONFIG.geminiBaseUrl,
+      `/v1beta/models/${encodeURIComponent(CONFIG.geminiModel)}:generateContent`,
+    ),
+    headers,
+    body,
+  );
+
+  // Gemini splits generated text across parts; join them back together.
+  const parts = response.candidates?.[0]?.content?.parts || [];
+  return parts.map((p) => p.text || "").join("");
 }
 
 // Dispatch to the configured provider. Anthropic (OAuth token or API key)
@@ -1062,6 +1405,9 @@ function getOriginRepo() {
   }
 }
 
+// Returns what actually happened, so the caller can report on real outcomes
+// instead of assuming every target in the list ended up with a PR:
+//   { status: "created" | "exists" | "skipped", url? }
 function createPullRequest(from, to, title) {
   // Strip "origin/" remote prefix only — preserve branch namespaces like "mch/feature"
   from = from.replace(/^origin\//, "");
@@ -1074,10 +1420,10 @@ function createPullRequest(from, to, title) {
       `To create PR automatically, install gh CLI:\n` +
         `  brew install gh  # macOS\n` +
         `  apt-get install gh  # Linux\n` +
-        `Then run: git-smart-commit --with-pr`,
+        `Then run: git smartc ${to} --pr-only`,
       "warning",
     );
-    return;
+    return { status: "skipped" };
   }
 
   const originRepo = getOriginRepo();
@@ -1092,7 +1438,7 @@ function createPullRequest(from, to, title) {
           `   Ensure the branch was pushed: git push origin ${from}`,
         "warning",
       );
-      return;
+      return { status: "skipped" };
     }
   } catch (e) {
     log(`Could not verify remote branch "${from}": ${e.message}`, "warning");
@@ -1117,7 +1463,7 @@ function createPullRequest(from, to, title) {
     ]);
     if (existing) {
       log(`PR already exists for ${from} → ${to}: ${existing}`, "warning");
-      return;
+      return { status: "exists", url: existing };
     }
   } catch (e) {
     // Ignore — proceed with creation attempt
@@ -1143,10 +1489,12 @@ function createPullRequest(from, to, title) {
     if (prUrl) {
       console.log(`   🔗 ${prUrl}`);
     }
+    return { status: "created", url: prUrl };
   } catch (e) {
     const errMsg = (e.stderr || e.message || "").toString();
     if (errMsg.includes("already exists")) {
       log(`PR already exists for ${from} → ${to}`, "warning");
+      return { status: "exists" };
     } else if (errMsg.includes("No commits between")) {
       log(`No new commits between ${to} and ${from} — skipping PR`, "warning");
     } else if (errMsg.includes("Head ref must be a branch")) {
@@ -1157,11 +1505,17 @@ function createPullRequest(from, to, title) {
         "warning",
       );
     } else {
-      log(
-        `Failed to create PR ${from} → ${to}: ${errMsg.split("\n").pop()}`,
-        "warning",
-      );
+      // gh often ends its stderr with a blank line, so take the last line
+      // that actually says something rather than a trailing empty one.
+      const detail =
+        errMsg
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .pop() || "unknown error";
+      log(`Failed to create PR ${from} → ${to}: ${detail}`, "warning");
     }
+    return { status: "skipped" };
   }
 }
 
@@ -1184,46 +1538,88 @@ function getUserConfirmation(message) {
   });
 }
 
-async function showPreview(
+// The plan, rendered as the pipeline itself: one line per step, in execution
+// order, each either describing what it will do or naming why it won't. Reading
+// it top to bottom tells the user exactly what this run is about to be.
+async function showPreview({
+  plan,
   commitMessage,
   currentBranch,
   targetBranches,
   prTitles = {},
-  autoStage = true,
   skipConfirm = false,
-  createPRs = true,
-) {
+  dryRun = false,
+}) {
   console.log("\n");
   console.log("╔════════════════════════════════════════════════╗");
-  console.log(
-    createPRs
-      ? "║         COMMIT & PR PREVIEW                     ║"
-      : "║         COMMIT & PUSH PREVIEW                   ║",
-  );
+  console.log("║                 WORKFLOW PLAN                   ║");
   console.log("╚════════════════════════════════════════════════╝");
   console.log("");
   console.log(`📌 Current branch: ${currentBranch}`);
-  console.log(
-    `${autoStage ? "📦" : "⏭️ "} Stage mode: ${autoStage ? "AUTO (all files)" : "MANUAL (staged only)"}`,
+  console.log("");
+
+  const step = (name, active, detail) =>
+    console.log(
+      `   ${active ? "✅" : "⏭️ "} ${name.padEnd(7)} ${detail || ""}`.trimEnd(),
+    );
+
+  const stageDetail = [
+    plan.unstaged && "modified files",
+    plan.untracked && "new files",
+  ]
+    .filter(Boolean)
+    .join(" + ");
+
+  step(
+    "stage",
+    plan.stage,
+    plan.stage ? `git add . (${stageDetail})` : plan.reasons.stage,
   );
-  const noCommitNote = createPRs
-    ? "(none — no new changes, push & PR only)"
-    : "(none — no new changes, push only)";
-  console.log(`💬 Commit message: ${commitMessage || noCommitNote}`);
-  if (createPRs) {
-    console.log(`📊 Target branches & PR titles:`);
+  step(
+    "commit",
+    plan.commit,
+    plan.commit ? `"${commitMessage}"` : plan.reasons.commit,
+  );
+  step(
+    "push",
+    plan.push,
+    plan.push ? `origin/${currentBranch}` : plan.reasons.push,
+  );
+  step("pr", plan.pr, plan.pr ? "" : plan.reasons.pr);
+
+  if (plan.pr) {
     for (const target of targetBranches) {
-      const title = prTitles[target] || "(generating...)";
-      console.log(`   → ${target}: ${title}`);
+      console.log(
+        `        → ${target}: ${prTitles[target] || "(generating...)"}`,
+      );
     }
-  } else {
-    console.log(`🚫 PR creation: SKIPPED (commit & push only)`);
-    console.log(`   → Pushing to origin/${currentBranch}`);
+  }
+
+  // Call out the consequences that are easy to misread from the checklist
+  // alone — chiefly work the run is deliberately leaving behind.
+  const caveats = [
+    plan.commit &&
+      !plan.push &&
+      "The new commit stays local — nothing will be pushed to origin.",
+    plan.pr &&
+      !plan.push &&
+      `PRs will describe what origin/${currentBranch} already has, not local work.`,
+    plan.staged &&
+      !plan.commit &&
+      "Staged changes are being left in the index, uncommitted.",
+    (plan.unstaged || plan.untracked) &&
+      !plan.stage &&
+      "Working-tree changes are being left behind.",
+  ].filter(Boolean);
+
+  if (caveats.length > 0) {
+    console.log("");
+    for (const caveat of caveats) log(caveat, "warning");
   }
   console.log("");
 
-  if (skipConfirm) {
-    log("Auto-confirmed (-y flag)", "success");
+  if (dryRun || skipConfirm) {
+    if (skipConfirm && !dryRun) log("Auto-confirmed (-y flag)", "success");
     return true;
   }
 
@@ -1243,29 +1639,52 @@ const USAGE = `Usage: git smartc [targets] [flags]
     ",",
   )})
 
-  --no-pr              Commit & push only, skip PR creation
-  --push-only, -po, -p Same as --no-pr
-  --no-stage, -ns      Skip auto-staging (commit only what's already staged)
+The run is a pipeline — stage → commit → push → pr — and each step executes
+only when it has something to do. There is no flag for "nothing to commit" or
+"nothing to push": those are read from the repository. Flags subtract steps.
+
+  Skip steps:
+  --no-stage,  -ns     Don't git add; commit only what's already staged
+  --no-commit, -nc     Don't commit at all (implies --no-stage)
+  --no-push,   -np     Don't push
+  --no-pr              Don't create PRs
+  --pr-only            PR only — shorthand for --no-commit --no-push
+  --push-only, -po, -p Alias for --no-pr
+
+  Other:
   --merge-local        Merge the target locally after the PR (non-protected only)
+  --dry-run            Print the plan and exit without changing anything
   -y, --yes            Skip the confirmation prompt
   -h, --help           Show this help
 
 Examples:
-  git smartc                     PR to ${CONFIG.defaultTargets.join(" & ")}
-  git smartc staging             PR to staging only
+  git smartc                     Stage, commit, push, PR to ${CONFIG.defaultTargets.join(
+    " & ",
+  )}
+  git smartc staging             Same, but PR to staging only
   git smartc main,staging        PR to main & staging
-  git smartc -ns uat -y          PR to uat only, no auto-stage, no prompt`;
+  git smartc uat -ns             Commit the current index only, push, PR
+  git smartc uat -nc             Leave the working tree alone: push, then PR
+  git smartc uat --pr-only       PR from what origin already has
+  git smartc --no-pr             Stage, commit & push, no PR
+  git smartc -ns uat -y          Flags may come before the targets`;
 
 // Every flag the CLI accepts. Anything else dash-prefixed is a typo and is
 // reported rather than silently ignored.
 const KNOWN_FLAGS = new Set([
+  "--no-stage",
+  "-ns",
+  "--no-commit",
+  "-nc",
+  "--no-push",
+  "-np",
   "--no-pr",
+  "--pr-only",
   "--push-only",
   "-po",
   "-p",
-  "--no-stage",
-  "-ns",
   "--merge-local",
+  "--dry-run",
   "-y",
   "--yes",
   "-h",
@@ -1326,16 +1745,47 @@ function parseArgs(argv) {
   }
 
   const has = (...names) => names.some((name) => flags.includes(name));
+  // The specific flag that switched a step off, or null. Kept (rather than a
+  // bare boolean) so every "skipped" line can name the flag responsible.
+  const offBy = (...names) =>
+    names.find((name) => flags.includes(name)) || null;
+
+  // Permission per pipeline step. This is intent only: whether a step actually
+  // runs is resolvePlan()'s call, since a permitted step with nothing to do is
+  // still skipped. --no-commit implies --no-stage (staging without committing
+  // would just leave a dirty index behind), and --pr-only implies both plus
+  // --no-push. --push-only and its short forms remain aliases for --no-pr.
+  const intent = {
+    stageOff: offBy("--no-stage", "-ns", "--no-commit", "-nc", "--pr-only"),
+    commitOff: offBy("--no-commit", "-nc", "--pr-only"),
+    pushOff: offBy("--no-push", "-np", "--pr-only"),
+    prOff: offBy("--no-pr", "--push-only", "-po", "-p"),
+  };
+  intent.allowStage = !intent.stageOff;
+  intent.allowCommit = !intent.commitOff;
+  intent.allowPush = !intent.pushOff;
+  intent.allowPR = !intent.prOff;
+
+  // Every step switched off leaves no pipeline to run at all. Catch it here
+  // rather than after the prerequisite checks and the remote fetch.
+  if (!intent.allowCommit && !intent.allowPush && !intent.allowPR) {
+    // Deduped because one flag can switch off several steps: --pr-only alone
+    // covers both commit and push.
+    const culprits = [
+      ...new Set([intent.commitOff, intent.pushOff, intent.prOff]),
+    ];
+    error(
+      `${culprits.join(" + ")} leave${culprits.length > 1 ? "" : "s"} nothing to do — commit, push and PR are all switched off.\n\n${USAGE}`,
+    );
+  }
 
   return {
     targetBranches,
-    // Commit & push only — no PR. --push-only (and its short forms) are
-    // aliases for --no-pr, named for what the run actually does.
-    createPRs: !has("--no-pr", "--push-only", "-po", "-p"),
-    autoStage: !has("--no-stage", "-ns"),
+    intent,
     // Merge locally after the PR (only meaningful for non-protected targets).
     autoMerge: has("--merge-local"),
     skipConfirm: has("-y", "--yes"),
+    dryRun: has("--dry-run"),
   };
 }
 
@@ -1346,12 +1796,12 @@ function parseArgs(argv) {
 async function main() {
   try {
     // Parse arguments
-    const { targetBranches, createPRs, autoStage, autoMerge, skipConfirm } =
+    const { targetBranches, intent, autoMerge, skipConfirm, dryRun } =
       parseArgs(process.argv.slice(2));
 
-    // Local merging happens in the PR stage, so it can't run in push-only mode.
-    if (autoMerge && !createPRs) {
-      log("--merge-local has no effect without PR creation", "warning");
+    // Local merging happens in the PR stage, so it can't run without one.
+    if (autoMerge && !intent.allowPR) {
+      log(`--merge-local has no effect with ${intent.prOff}`, "warning");
     }
 
     // Welcome
@@ -1363,35 +1813,64 @@ async function main() {
     checkPrerequisites();
     console.log("");
 
-    // Get current state
     const currentBranch = getCurrentBranch();
-    const diff = getGitDiff();
-    const recentCommits = getRecentCommits();
-    const hasChanges = !!diff;
 
-    // Generate commit message (only when there are changes to commit)
-    let commitMessage = null;
-    if (hasChanges) {
-      commitMessage = await generateCommitMessage(diff, recentCommits);
-    } else {
-      log(
-        createPRs
-          ? "No changes to commit — will push existing commits and create PRs."
-          : "No changes to commit — will push existing commits only.",
-        "warning",
-      );
-    }
-
-    // Push-only mode never touches the targets, so skip the fetch and the
-    // per-target AI calls entirely instead of generating titles we discard.
-    const prTitles = {};
-    if (createPRs) {
-      // Fetch latest remote state so origin/* refs are up-to-date for diff & PR
-      // checks. This is what makes each target branch current with the remote
-      // before generatePRTitle compares against origin/<target> below.
+    // origin/* must be current before the plan can judge whether a push is
+    // needed or whether a PR would have any commits behind it, so the fetch
+    // comes before the decision. Skipped when neither step is permitted.
+    if (intent.allowPush || intent.allowPR) {
       log("Fetching latest remote state...", "loading");
       fetchRemote("origin");
+    }
 
+    // Decide the whole run up front: which steps the flags allow, intersected
+    // with which steps the repository actually needs.
+    const plan = resolvePlan(intent, currentBranch);
+
+    if (!plan.stage && !plan.commit && !plan.push && !plan.pr) {
+      console.log("");
+      log("Nothing to do — every step is either off or already done.", "info");
+      for (const [name, why] of Object.entries(plan.reasons)) {
+        if (why) console.log(`   ${name.padEnd(7)} ${why}`);
+      }
+      console.log("");
+      process.exit(0);
+    }
+
+    // Generate a commit message only when a commit is going to happen, and
+    // from exactly what will land in it: the whole working tree when this run
+    // stages, the index alone when it doesn't.
+    let commitMessage = null;
+    // Kept in the outer scope because the PR title generator needs it too: the
+    // titles are produced before the commit exists, so without the pending diff
+    // they would describe only work that was already committed.
+    let pendingDiff = "";
+    if (plan.commit) {
+      const diff = getGitDiff({ includeUnstaged: plan.stage });
+      if (diff) {
+        pendingDiff = diff;
+        commitMessage = await generateCommitMessage(diff, getRecentCommits());
+      } else {
+        // Nothing readable to describe, so there is nothing to commit
+        // either. This shouldn't happen — the plan only reaches here with
+        // staged or stageable content — so dump the status to explain it.
+        log(
+          "No readable diff for the pending changes — skipping commit.",
+          "warning",
+        );
+        debugGitStatus();
+        plan.stage = false;
+        plan.commit = false;
+        plan.reasons.stage = plan.reasons.stage || "skipped (no readable diff)";
+        plan.reasons.commit =
+          plan.reasons.commit || "skipped (no readable diff)";
+      }
+    }
+
+    // Titles cost one AI call per distinct target context, so only generate
+    // them when PRs are actually part of the plan.
+    const prTitles = {};
+    if (plan.pr) {
       // Gather the full picture for each target, then generate titles in
       // parallel. Targets that resolve to identical context (common when two
       // release branches are at the same commit) share one AI call instead of
@@ -1400,10 +1879,12 @@ async function main() {
         targetBranches.map((target) => [
           target,
           collectPRContext(currentBranch, target, {
-            pendingDiff: diff,
-            commitMessage,
+            // Only work this run will actually push counts as "pending"; with
+            // --no-push the PR can describe nothing but what origin has.
+            pendingDiff: plan.push ? pendingDiff : "",
+            commitMessage: plan.push ? commitMessage : null,
             // Untracked files only reach the PR when this run stages them.
-            includeUntracked: autoStage && hasChanges,
+            includeUntracked: plan.stage && plan.push,
           }),
         ]),
       );
@@ -1415,7 +1896,10 @@ async function main() {
         if (!pending.has(key)) {
           pending.set(
             key,
-            generatePRTitle(context, target, { commitMessage, currentBranch }),
+            generatePRTitle(context, target, {
+              commitMessage: plan.push ? commitMessage : null,
+              currentBranch,
+            }),
           );
         }
       }
@@ -1427,44 +1911,46 @@ async function main() {
     }
 
     // Show preview
-    const confirmed = await showPreview(
+    const confirmed = await showPreview({
+      plan,
       commitMessage,
       currentBranch,
       targetBranches,
       prTitles,
-      autoStage,
       skipConfirm,
-      createPRs,
-    );
+      dryRun,
+    });
+
+    if (dryRun) {
+      log("Dry run — nothing was changed.", "info");
+      console.log("");
+      process.exit(0);
+    }
 
     if (!confirmed) {
       log("Aborted", "error");
       process.exit(0);
     }
 
-    // Execute workflow
+    // Execute workflow. Every step is already decided, so this is a straight
+    // run through the pipeline — no step can fail for having nothing to do.
     console.log("");
     log("Executing workflow...", "loading");
     console.log("");
 
-    if (hasChanges) {
-      if (autoStage) {
-        stageChanges();
-      } else {
-        log("Skipping auto-stage (use --no-stage)", "warning");
-        debugGitStatus();
-      }
-      createCommit(commitMessage);
-    } else {
-      log("No changes to commit — skipping stage & commit.", "info");
-    }
-    pushChanges(currentBranch);
+    if (plan.stage) stageChanges();
+    if (plan.commit) createCommit(commitMessage);
+    if (plan.push) pushChanges(currentBranch);
 
     // Create PRs
-    if (createPRs) {
+    if (plan.pr) {
       console.log("");
       log("Creating pull requests...", "loading");
       console.log("");
+      // What each target actually ended up with. The merge instructions below
+      // are built from this rather than from targetBranches, so a target whose
+      // PR was guarded away is never reported as one that got a PR.
+      const prOutcome = new Map();
       for (const target of targetBranches) {
         // Guard: compare remote-to-remote so we check exactly what GitHub sees.
         // origin/<currentBranch> is updated automatically by git push, so this
@@ -1476,6 +1962,7 @@ async function main() {
               `Branch ${currentBranch} not found on origin — skipping PR for ${target}`,
               "warning",
             );
+            prOutcome.set(target, "skipped");
             continue;
           }
           if (!remoteBranchExists(target)) {
@@ -1483,6 +1970,7 @@ async function main() {
               `Target origin/${target} not found — skipping PR for ${target}`,
               "warning",
             );
+            prOutcome.set(target, "skipped");
             continue;
           }
           const ahead = run("git", [
@@ -1495,6 +1983,7 @@ async function main() {
               `No commits ahead of origin/${target} on origin/${currentBranch} — skipping PR creation`,
               "warning",
             );
+            prOutcome.set(target, "skipped");
             continue;
           }
         } catch (guardErr) {
@@ -1506,11 +1995,14 @@ async function main() {
             `Skipping PR for ${target} — ensure ${currentBranch} is pushed to origin`,
             "warning",
           );
+          prOutcome.set(target, "skipped");
           continue;
         }
 
-        const prTitle = prTitles[target] || commitMessage;
-        createPullRequest(currentBranch, target, prTitle);
+        const prTitle =
+          prTitles[target] || commitMessage || `${currentBranch} → ${target}`;
+        const result = createPullRequest(currentBranch, target, prTitle);
+        prOutcome.set(target, result ? result.status : "skipped");
       }
 
       console.log("");
@@ -1520,47 +2012,69 @@ async function main() {
 
       // Check for protected branches
       const protectedBranches = ["main", "master", "uat", "staging"];
-      const hasProtected = targetBranches.some((b) =>
+      // Only targets that have an open PR — freshly created or already there —
+      // get merge instructions. A skipped target gets its own line instead.
+      const withPR = targetBranches.filter((b) =>
+        ["created", "exists"].includes(prOutcome.get(b)),
+      );
+      const skipped = targetBranches.filter(
+        (b) => !["created", "exists"].includes(prOutcome.get(b)),
+      );
+      const label = (b) =>
+        prOutcome.get(b) === "created"
+          ? `PR created for → ${b}`
+          : `PR already open for → ${b}`;
+
+      const protectedWithPR = withPR.filter((b) =>
         protectedBranches.includes(b),
       );
-      const nonProtected = targetBranches.filter(
+      const nonProtectedWithPR = withPR.filter(
         (b) => !protectedBranches.includes(b),
       );
 
-      if (hasProtected) {
+      if (protectedWithPR.length > 0) {
         console.log("\n📢 Protected Branches (main, uat, staging, master):");
         console.log("   ✋ Cannot merge locally - use GitHub/GitLab UI");
-        targetBranches
-          .filter((b) => protectedBranches.includes(b))
-          .forEach((branch) => {
-            console.log(`   📍 PR created for → ${branch}`);
-          });
+        protectedWithPR.forEach((branch) => {
+          console.log(`   📍 ${label(branch)}`);
+        });
       }
 
-      if (nonProtected.length > 0) {
+      if (nonProtectedWithPR.length > 0) {
         console.log("\n🔓 Non-Protected Branches:");
         console.log("   ✅ Can merge locally or via UI");
-        nonProtected.forEach((branch) => {
-          console.log(`   📍 PR created for → ${branch}`);
+        nonProtectedWithPR.forEach((branch) => {
+          console.log(`   📍 ${label(branch)}`);
         });
 
         if (autoMerge) {
           console.log("\n   Merging locally...");
-          for (const branch of nonProtected) {
+          for (const branch of nonProtectedWithPR) {
             mergeBranch(currentBranch, branch);
           }
         }
       }
 
-      console.log("\n💡 Next steps:");
-      console.log("   1. Review PR on GitHub/GitLab");
-      console.log("   2. Request/wait for approvals");
-      console.log("   3. Merge via UI when ready\n");
+      if (skipped.length > 0) {
+        console.log("\n⏭️  No PR for: " + skipped.join(", "));
+        console.log("   See the warnings above for why.");
+      }
+
+      if (withPR.length > 0) {
+        console.log("\n💡 Next steps:");
+        console.log("   1. Review PR on GitHub/GitLab");
+        console.log("   2. Request/wait for approvals");
+        console.log("   3. Merge via UI when ready\n");
+      } else {
+        console.log("");
+      }
     } else {
       console.log("");
-      log("Skipped PR creation (commit & push only)", "info");
+      log(`Skipped PR creation (${intent.prOff})`, "info");
       console.log(
-        `   Open a PR later with: git smartc ${CONFIG.defaultTargets.join(",")}`,
+        `   Open a PR later with: git smartc ${CONFIG.defaultTargets.join(
+          ",",
+        )} --pr-only`,
       );
     }
 
