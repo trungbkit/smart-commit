@@ -44,6 +44,7 @@ const https = require("https");
 const http = require("http");
 const tls = require("tls");
 const crypto = require("crypto");
+const fs = require("fs");
 
 // ============================================================================
 // CONFIG
@@ -951,10 +952,10 @@ async function postJSON(url, headers, body) {
 // PROVIDER APIS
 // ============================================================================
 
-async function callClaudeAPI(prompt) {
+async function callClaudeAPI(prompt, { maxTokens = CONFIG.maxTokens } = {}) {
   const body = JSON.stringify({
     model: CONFIG.model,
-    max_tokens: CONFIG.maxTokens,
+    max_tokens: maxTokens,
     messages: [
       {
         role: "user",
@@ -984,10 +985,10 @@ async function callClaudeAPI(prompt) {
   return response.content?.[0]?.text || "";
 }
 
-async function callOpenAIAPI(prompt) {
+async function callOpenAIAPI(prompt, { maxTokens = CONFIG.maxTokens } = {}) {
   const body = JSON.stringify({
     model: CONFIG.openaiModel,
-    max_tokens: CONFIG.maxTokens,
+    max_tokens: maxTokens,
     messages: [
       {
         role: "user",
@@ -1010,7 +1011,7 @@ async function callOpenAIAPI(prompt) {
   return response.choices?.[0]?.message?.content || "";
 }
 
-async function callGeminiAPI(prompt) {
+async function callGeminiAPI(prompt, { maxTokens = CONFIG.maxTokens } = {}) {
   const body = JSON.stringify({
     contents: [
       {
@@ -1019,7 +1020,7 @@ async function callGeminiAPI(prompt) {
       },
     ],
     generationConfig: {
-      maxOutputTokens: CONFIG.maxTokens,
+      maxOutputTokens: maxTokens,
     },
   });
 
@@ -1047,14 +1048,14 @@ async function callGeminiAPI(prompt) {
 
 // Dispatch to the configured provider. Anthropic (OAuth token or API key)
 // takes priority, then OpenAI, then Gemini.
-function callAI(prompt) {
+function callAI(prompt, options = {}) {
   switch (activeProvider()) {
     case "anthropic":
-      return callClaudeAPI(prompt);
+      return callClaudeAPI(prompt, options);
     case "openai":
-      return callOpenAIAPI(prompt);
+      return callOpenAIAPI(prompt, options);
     case "gemini":
-      return callGeminiAPI(prompt);
+      return callGeminiAPI(prompt, options);
     default:
       return Promise.reject(new Error("No API credentials configured"));
   }
@@ -1063,7 +1064,7 @@ function callAI(prompt) {
 async function generateCommitMessage(diff, recentCommits) {
   log(`Analyzing changes with ${providerLabel()}...`, "loading");
 
-  const prompt = `You are a professional git commit message generator. Analyze the following code changes and generate a concise, meaningful commit message.
+  const prompt = `You are a professional git commit message generator. Analyze the following code changes and generate a meaningful commit message with a title and a description.
 
 ## Recent commits for context:
 \`\`\`
@@ -1076,22 +1077,73 @@ ${diff}
 \`\`\`
 
 ## Requirements:
-1. Follow conventional commits format: type(scope): description
+1. The first line is the title, in conventional commits format: type(scope): description
 2. Types: feat, fix, refactor, chore, docs, test, style, perf, ci, build
-3. Keep description under 50 characters
-4. Be specific about what changed
-5. Use imperative mood (e.g., "add" not "added")
-6. Return ONLY the commit message, nothing else
+3. Keep the title under 50 characters, with no trailing period
+4. After the title, leave one blank line, then write the description
+5. The description is 1-5 bullet points starting with "- ", each explaining what changed and why — behaviour and intent, not file names or line counts
+6. Wrap description lines at ${COMMIT_BODY_WRAP} characters
+7. Use imperative mood (e.g., "add" not "added") in both title and description
+8. Return ONLY the commit message, with no labels like "Title:", no quotes, and no code fences
 
-Example format: feat(auth): add login validation
+Example:
+feat(auth): add login validation
+
+- Reject empty and malformed emails before hitting the API
+- Show inline field errors instead of a generic toast
 `;
 
   try {
-    const message = await callAI(prompt);
-    return message.trim();
+    const raw = await callAI(prompt);
+    const message = parseCommitMessage(raw);
+    if (!message) {
+      error(`${providerLabel()} returned an unusable commit message:\n${raw}`);
+    }
+    return message;
   } catch (err) {
     error(`Failed to generate commit message: ${err.message}`);
   }
+}
+
+const COMMIT_TITLE_MAX_LENGTH = 72;
+const COMMIT_BODY_WRAP = 72;
+
+// Reduce the model's reply to "title\n\ndescription" (or just the title when no
+// description came back), tolerating the same fences, preambles and labels
+// sanitizeTitle() handles. Returns null when no usable title is found.
+function parseCommitMessage(raw) {
+  if (!raw) return null;
+
+  const lines = String(raw)
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/```[a-z]*/gi, "")
+    .replace(/\r/g, "")
+    .split("\n")
+    .map((line) => line.trimEnd());
+
+  const start = lines.findIndex(
+    (line) => line.trim() && !isPreambleLine(line.trim()),
+  );
+  if (start === -1) return null;
+
+  const title = sanitizeTitle(lines[start], {
+    maxLength: COMMIT_TITLE_MAX_LENGTH,
+  });
+  if (!title) return null;
+
+  const body = lines
+    .slice(start + 1)
+    .join("\n")
+    .replace(/^\s*(description|body)\s*:\s*/i, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+
+  return body ? `${title}\n\n${body}` : title;
+}
+
+// The title line of a commit message, for places that only have room for one.
+function commitTitle(message) {
+  return message ? message.split("\n")[0] : message;
 }
 
 const PR_TITLE_MAX_LENGTH = 72;
@@ -1105,7 +1157,7 @@ function buildHumanPRTitle(
   currentBranch,
   commits = [],
 ) {
-  const fromCommit = commitMessage || commits[0];
+  const fromCommit = commitTitle(commitMessage) || commits[0];
   if (fromCommit) {
     // Keep the conventional-commit prefix if there is one — it is meaningful
     // in a PR title too — and only tidy up the description that follows.
@@ -1131,6 +1183,15 @@ function buildHumanPRTitle(
   return `Merge changes into ${targetBranch}`;
 }
 
+// A conversational lead-in ("Here's the title:") or a bare label line, rather
+// than the answer itself.
+function isPreambleLine(line) {
+  return (
+    /^(sure|okay|ok|here('s| is)|certainly|based on)\b/i.test(line) ||
+    /^((pr|commit)\s+)?(title|message)\s*:?$/i.test(line)
+  );
+}
+
 // Models routinely wrap the answer in fences, quotes, a "Sure, here's..."
 // preamble, or a reasoning block, and the old code passed all of that straight
 // into `gh pr create --title`. Reduce whatever came back to a single clean
@@ -1151,13 +1212,10 @@ function sanitizeTitle(raw, { maxLength = PR_TITLE_MAX_LENGTH } = {}) {
 
   // Skip a conversational preamble ("Here's the title:") if a real title
   // follows it; otherwise fall back to the first line we have.
-  const isPreamble = (line) =>
-    /^(sure|okay|ok|here('s| is)|certainly|based on)\b/i.test(line) ||
-    /^(pr\s+)?title\s*:?$/i.test(line);
-  let title = lines.find((line) => !isPreamble(line)) || lines[0];
+  let title = lines.find((line) => !isPreambleLine(line)) || lines[0];
 
   title = title
-    .replace(/^(?:pr\s+)?title\s*[:\-—]\s*/i, "")
+    .replace(/^(?:(?:pr|commit)\s+)?(?:title|message)\s*[:\-—]\s*/i, "")
     .replace(/^[-*+]\s+/, "") // list bullet
     .replace(/^#+\s*/, "") // markdown heading
     .replace(/^["'`“‘]+|["'`”’]+$/g, "") // wrapping quotes
@@ -1205,7 +1263,9 @@ function promptSection(heading, body) {
   return body && String(body).trim() ? `\n## ${heading}\n${body}\n` : "";
 }
 
-function buildPRTitlePrompt(context) {
+// The branch material shared by the PR title and description prompts, so both
+// describe exactly the same change.
+function prContextSections(context) {
   const {
     fromBranch,
     commitMessage,
@@ -1217,14 +1277,12 @@ function buildPRTitlePrompt(context) {
     generated = [],
   } = context;
 
-  return `You are a senior engineer writing the title of a pull request. Read every section below, then output one title.
-
-${promptSection("Source branch", `\`${fromBranch}\``)}${promptSection(
+  return `${promptSection("Source branch", `\`${fromBranch}\``)}${promptSection(
     "Commits already on this branch (newest first)",
     commits.length ? commits.map((s) => `- ${s}`).join("\n") : "",
   )}${promptSection(
     "Commit about to be added",
-    commitMessage ? `- ${commitMessage}` : "",
+    commitMessage ? `\`\`\`\n${commitMessage}\n\`\`\`` : "",
   )}${promptSection("Files changed", stat ? `\`\`\`\n${stat}\n\`\`\`` : "")}${promptSection(
     "New files not yet tracked by git",
     untracked.length ? untracked.map((f) => `- ${f}`).join("\n") : "",
@@ -1237,7 +1295,13 @@ ${promptSection("Source branch", `\`${fromBranch}\``)}${promptSection(
   )}${promptSection(
     "Excluded from the diff above (generated files, ignore them)",
     generated.length ? generated.map((f) => `- ${f}`).join("\n") : "",
-  )}
+  )}`;
+}
+
+function buildPRTitlePrompt(context) {
+  return `You are a senior engineer writing the title of a pull request. Read every section below, then output one title.
+
+${prContextSections(context)}
 ## How to choose the title
 1. Identify the single most important user- or developer-visible outcome of the whole branch. That is the title. Supporting refactors, test updates, and formatting are not the title.
 2. Format: \`type(scope): description\` — types: feat, fix, refactor, chore, docs, test, style, perf, ci, build.
@@ -1285,14 +1349,7 @@ async function generatePRTitle(context, targetBranch, options = {}) {
     context.commits,
   );
 
-  // Nothing at all to summarize: no branch commits, no diff, no pending work.
-  const hasMaterial =
-    Boolean(context.diff) ||
-    Boolean(context.pendingDiff) ||
-    context.commits.length > 0 ||
-    context.untracked.length > 0;
-
-  if (!hasMaterial) {
+  if (!hasPRMaterial(context)) {
     log(
       `No changes found between origin/${targetBranch} and ${currentBranch}. ` +
         `Using "${humanFallback}" as the PR title.`,
@@ -1320,6 +1377,173 @@ async function generatePRTitle(context, targetBranch, options = {}) {
   }
 }
 
+// False when there is nothing at all to summarize: no branch commits, no
+// diff, no pending work.
+function hasPRMaterial(context) {
+  return (
+    Boolean(context.diff) ||
+    Boolean(context.pendingDiff) ||
+    context.commits.length > 0 ||
+    context.untracked.length > 0
+  );
+}
+
+// Descriptions run to several sections, well past the budget a title needs.
+const PR_DESCRIPTION_MAX_TOKENS = 1500;
+const PR_TEMPLATE_MAX_CHARS = 4000;
+
+// The repository's own pull request template, in the places GitHub looks for
+// one: the repo root, .github/ and docs/, any filename case. `gh pr create
+// --body` bypasses the template, so the description generator fills it in
+// instead. A PULL_REQUEST_TEMPLATE/ directory of several templates is ignored:
+// GitHub makes the author pick one, and there is no right default here.
+function findPRTemplate() {
+  let root;
+  try {
+    root = run("git", ["rev-parse", "--show-toplevel"]);
+  } catch {
+    return null;
+  }
+  for (const dir of ["", ".github", "docs"]) {
+    const base = dir ? `${root}/${dir}` : root;
+    let entries;
+    try {
+      entries = fs.readdirSync(base);
+    } catch {
+      continue;
+    }
+    const name = entries.find((entry) =>
+      /^pull_request_template\.(md|txt)$/i.test(entry),
+    );
+    if (!name) continue;
+    try {
+      const content = fs.readFileSync(`${base}/${name}`, "utf8").trim();
+      if (content) {
+        return {
+          path: dir ? `${dir}/${name}` : name,
+          content: content.slice(0, PR_TEMPLATE_MAX_CHARS),
+        };
+      }
+    } catch {
+      // Unreadable template: fall through to the standard layout.
+    }
+  }
+  return null;
+}
+
+const STANDARD_PR_LAYOUT = `## Summary
+1-3 sentences: what this PR does and why it is needed.
+
+## Changes
+- The notable changes as bullets, most important first, grouped by area when there are several.
+
+## How to test
+- Concrete steps or commands a reviewer can run to verify the change. If the diff adds or updates tests, name them.
+
+## Notes
+- Breaking changes, migrations, new environment variables or config, deployment steps, known limitations, or follow-ups. Omit this whole section when there are none.`;
+
+function buildPRDescriptionPrompt(context, template = null) {
+  const layout = template
+    ? `This repository has a pull request template. Fill it in: keep its headings, their order, and any checklists. Replace placeholder text and HTML comments with real content, tick a checklist box only when the material above shows it is done, and write "N/A" under a heading that does not apply.
+
+\`\`\`\`markdown
+${template.content}
+\`\`\`\``
+    : `Use exactly these sections:
+
+${STANDARD_PR_LAYOUT}`;
+
+  return `You are a senior engineer writing the description of a pull request for its reviewers. Read every section below, then write the description.
+
+${prContextSections(context)}
+## Layout
+${layout}
+
+## Rules
+1. GitHub-flavoured Markdown.
+2. Describe behaviour and intent — what changed and why — not file names or line counts, unless a file is itself the point (a new config file, a migration).
+3. Base every statement on the material above. Never invent ticket or issue numbers, links, screenshots, benchmarks, or test results. You do not know how the author tested this, so give reviewers steps to verify it rather than claiming it was tested.
+4. Be concise: a reviewer should grasp the PR in under a minute. Leave filler out rather than padding a section.
+5. Do not repeat the PR title as a heading, and do not mention the target branch.
+
+Output only the description, with no preamble and no code fence around it.`;
+}
+
+// Reduce the model's reply to the Markdown description itself, or null when
+// nothing usable came back.
+function sanitizePRDescription(raw) {
+  if (!raw) return null;
+
+  const lines = String(raw)
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/\r/g, "")
+    .split("\n");
+  while (
+    lines.length &&
+    (!lines[0].trim() ||
+      isPreambleLine(lines[0].trim()) ||
+      /^(pr\s+)?description\s*:?$/i.test(lines[0].trim()))
+  ) {
+    lines.shift();
+  }
+  let text = lines.join("\n").trim();
+
+  // Unwrap a fence around the whole reply, keeping any fences inside it.
+  const fenced = text.match(/^```[a-z]*\n([\s\S]*?)\n```$/i);
+  if (fenced) text = fenced[1];
+  text = text.replace(/\n{3,}/g, "\n\n").trim();
+
+  if (text.length < 20) return null;
+  if (
+    /^(i (can|cannot|can't|'m|am)\b|as an ai\b|sorry\b|unable to\b)/i.test(text)
+  ) {
+    return null;
+  }
+  return text;
+}
+
+// A description built without the AI, from the commit subjects alone. It never
+// names the target branch, because targets with identical context share one.
+function buildHumanPRDescription(context) {
+  const items = [
+    ...new Set(
+      [commitTitle(context.commitMessage), ...context.commits].filter(Boolean),
+    ),
+  ];
+  const summary = items[0] || `Changes from \`${context.fromBranch}\`.`;
+  const changes = items.length > 1 ? items.map((s) => `- ${s}`).join("\n") : "";
+  return changes
+    ? `## Summary\n\n${summary}\n\n## Changes\n\n${changes}`
+    : `## Summary\n\n${summary}`;
+}
+
+async function generatePRDescription(context, targetBranch, template = null) {
+  const humanFallback = buildHumanPRDescription(context);
+  // generatePRTitle() has already warned about an empty branch.
+  if (!hasPRMaterial(context)) return humanFallback;
+
+  log(`Generating PR description for ${targetBranch}...`, "loading");
+
+  try {
+    const raw = await callAI(buildPRDescriptionPrompt(context, template), {
+      maxTokens: PR_DESCRIPTION_MAX_TOKENS,
+    });
+    const description = sanitizePRDescription(raw);
+    if (!description) {
+      log(
+        `${providerLabel()} returned an unusable PR description. Falling back to the commit list.`,
+        "warning",
+      );
+      return humanFallback;
+    }
+    return description;
+  } catch (err) {
+    log(`Failed to generate PR description: ${err.message}`, "warning");
+    return humanFallback;
+  }
+}
+
 // ============================================================================
 // GIT OPERATIONS
 // ============================================================================
@@ -1342,7 +1566,7 @@ function stageChanges() {
 }
 
 function createCommit(message) {
-  log(`Creating commit: "${message}"`, "loading");
+  log(`Creating commit: "${commitTitle(message)}"`, "loading");
   try {
     run("git", ["commit", "-m", message]);
     log("Commit created", "success");
@@ -1408,7 +1632,7 @@ function getOriginRepo() {
 // Returns what actually happened, so the caller can report on real outcomes
 // instead of assuming every target in the list ended up with a PR:
 //   { status: "created" | "exists" | "skipped", url? }
-function createPullRequest(from, to, title) {
+function createPullRequest(from, to, title, body = "") {
   // Strip "origin/" remote prefix only — preserve branch namespaces like "mch/feature"
   from = from.replace(/^origin\//, "");
   to = to.replace(/^origin\//, "");
@@ -1482,7 +1706,7 @@ function createPullRequest(from, to, title) {
       "--title",
       title,
       "--body",
-      "",
+      body,
       ...repoArgs,
     ]);
     log(`PR created: ${from} → ${to}`, "success");
@@ -1547,6 +1771,7 @@ async function showPreview({
   currentBranch,
   targetBranches,
   prTitles = {},
+  prDescriptions = {},
   skipConfirm = false,
   dryRun = false,
 }) {
@@ -1578,8 +1803,15 @@ async function showPreview({
   step(
     "commit",
     plan.commit,
-    plan.commit ? `"${commitMessage}"` : plan.reasons.commit,
+    plan.commit ? `"${commitTitle(commitMessage)}"` : plan.reasons.commit,
   );
+  if (plan.commit) {
+    // The description, indented under the title so the checklist stays readable.
+    const description = commitMessage.split("\n").slice(1).join("\n").trim();
+    for (const line of description ? description.split("\n") : []) {
+      console.log(`           ${line}`.trimEnd());
+    }
+  }
   step(
     "push",
     plan.push,
@@ -1588,10 +1820,22 @@ async function showPreview({
   step("pr", plan.pr, plan.pr ? "" : plan.reasons.pr);
 
   if (plan.pr) {
+    // Targets that share a context share a description; print it once.
+    const shown = new Map();
     for (const target of targetBranches) {
       console.log(
         `        → ${target}: ${prTitles[target] || "(generating...)"}`,
       );
+      const description = prDescriptions[target];
+      if (!description) continue;
+      if (shown.has(description)) {
+        console.log(`          (same description as ${shown.get(description)})`);
+        continue;
+      }
+      shown.set(description, target);
+      for (const line of description.split("\n")) {
+        console.log(`          ${line}`.trimEnd());
+      }
     }
   }
 
@@ -1867,12 +2111,16 @@ async function main() {
       }
     }
 
-    // Titles cost one AI call per distinct target context, so only generate
-    // them when PRs are actually part of the plan.
+    // Titles and descriptions cost one AI call each per distinct target
+    // context, so only generate them when PRs are actually part of the plan.
     const prTitles = {};
+    const prDescriptions = {};
     if (plan.pr) {
-      // Gather the full picture for each target, then generate titles in
-      // parallel. Targets that resolve to identical context (common when two
+      const template = findPRTemplate();
+      if (template) log(`Using PR template ${template.path}`, "info");
+
+      // Gather the full picture for each target, then generate titles and
+      // descriptions in parallel. Targets that resolve to identical context (common when two
       // release branches are at the same commit) share one AI call instead of
       // paying for the same answer twice.
       const contexts = new Map(
@@ -1896,15 +2144,18 @@ async function main() {
         if (!pending.has(key)) {
           pending.set(
             key,
-            generatePRTitle(context, target, {
-              commitMessage: plan.push ? commitMessage : null,
-              currentBranch,
-            }),
+            Promise.all([
+              generatePRTitle(context, target, {
+                commitMessage: plan.push ? commitMessage : null,
+                currentBranch,
+              }),
+              generatePRDescription(context, target, template),
+            ]),
           );
         }
       }
       for (const target of targetBranches) {
-        prTitles[target] = await pending.get(
+        [prTitles[target], prDescriptions[target]] = await pending.get(
           contextCacheKey(contexts.get(target)),
         );
       }
@@ -1917,6 +2168,7 @@ async function main() {
       currentBranch,
       targetBranches,
       prTitles,
+      prDescriptions,
       skipConfirm,
       dryRun,
     });
@@ -2000,8 +2252,15 @@ async function main() {
         }
 
         const prTitle =
-          prTitles[target] || commitMessage || `${currentBranch} → ${target}`;
-        const result = createPullRequest(currentBranch, target, prTitle);
+          prTitles[target] ||
+          commitTitle(commitMessage) ||
+          `${currentBranch} → ${target}`;
+        const result = createPullRequest(
+          currentBranch,
+          target,
+          prTitle,
+          prDescriptions[target],
+        );
         prOutcome.set(target, result ? result.status : "skipped");
       }
 
