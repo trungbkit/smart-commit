@@ -189,8 +189,9 @@ with an error rather than silently ignored.
    describes exactly what the commit will contain. Truncated to 5000 lines.
 5. **Generates the commit message** — only when a commit is actually planned.
    The message has a conventional-commit title (`type(scope): description`)
-   followed by a blank line and a short bulleted description of what changed
-   and why
+   followed by a description of what changed and why, sized to the change:
+   none for trivial changes, a sentence or two of prose for focused ones, and
+   one bullet per distinct part for larger ones
 6. **Generates a PR title per target** — only when PRs are planned; in parallel, from `git diff origin/<target>...<branch>` (truncated to 8000 lines). If the target doesn't exist on the remote, the diff is empty, or the API call fails, it falls back to a human-readable title derived from the commit message or branch name.
    A **PR description** is generated alongside each title from the same material. If the repo has a pull request template (`pull_request_template.md` in the root, `.github/` or `docs/`), the description fills it in; otherwise it uses the standard layout: **Summary**, **Changes**, **How to test**, and **Notes** (the last only when there are breaking changes, migrations, new config, or follow-ups). It never invents tickets or test results. If the API call fails, the description falls back to a summary built from the commit subjects.
 7. **Shows the plan** and waits for confirmation (unless `-y` or `--dry-run`)

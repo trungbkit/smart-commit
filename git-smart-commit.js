@@ -1080,17 +1080,29 @@ ${diff}
 1. The first line is the title, in conventional commits format: type(scope): description
 2. Types: feat, fix, refactor, chore, docs, test, style, perf, ci, build
 3. Keep the title under 50 characters, with no trailing period
-4. After the title, leave one blank line, then write the description
-5. The description is 1-5 bullet points starting with "- ", each explaining what changed and why — behaviour and intent, not file names or line counts
+4. Size the description to the change. There is no fixed length or number of points:
+   - A trivial or self-explanatory change (typo, version bump, rename) needs no description — return only the title
+   - A focused change gets a sentence or two of plain prose
+   - Only a change with several distinct parts gets bullet points starting with "- ", one per part — as many as there are parts, never padded or merged to reach a count
+5. When there is a description, leave one blank line after the title. Explain what changed and why — behaviour and intent, not file names or line counts
 6. Wrap description lines at ${COMMIT_BODY_WRAP} characters
 7. Use imperative mood (e.g., "add" not "added") in both title and description
 8. Return ONLY the commit message, with no labels like "Title:", no quotes, and no code fences
 
-Example:
+Examples of different sizes:
+
+docs(readme): fix typo in install steps
+
+fix(api): retry requests on 503 responses
+
+The upstream gateway returns 503 during deploys, which surfaced as a hard
+failure. Retry up to three times with backoff before giving up.
+
 feat(auth): add login validation
 
 - Reject empty and malformed emails before hitting the API
 - Show inline field errors instead of a generic toast
+- Lock the form after five failed attempts
 `;
 
   try {
